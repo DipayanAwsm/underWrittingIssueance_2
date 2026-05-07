@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 
@@ -48,6 +49,32 @@ st.markdown(
     }
     div[data-testid="stMetricDelta"] {
         font-weight: 650;
+    }
+    .hero-kpi {
+        background: linear-gradient(150deg, #eef5ff 0%, #ffffff 100%);
+        border: 1px solid #cfe0ff;
+        border-radius: 14px;
+        padding: 0.95rem 1rem;
+        box-shadow: 0 8px 16px rgba(15, 76, 129, 0.12);
+        min-height: 180px;
+    }
+    .hero-kpi-title {
+        color: #0f4c81;
+        font-weight: 700;
+        font-size: 0.98rem;
+        margin-bottom: 0.2rem;
+    }
+    .hero-kpi-value {
+        color: #0b253a;
+        font-weight: 800;
+        font-size: 2rem;
+        line-height: 1.2;
+        margin-bottom: 0.45rem;
+    }
+    .hero-kpi-sub {
+        color: #35556d;
+        font-size: 0.9rem;
+        margin-bottom: 0.2rem;
     }
     </style>
     """,
@@ -540,39 +567,97 @@ def render_tab_one(filtered_df):
             )
 
             st.markdown("#### KPI Tiles")
+            mean_tat = tab1_completed["TAT_Days"].mean()
             total_cases = len(tab1_df)
-            st.metric("Total Number of Cases", f"{total_cases:,}")
+
+            current_count = len(tab1_df)
+            delta_text = "No previous month"
+            current_month_label = "Multiple/All"
+            if len(month_case_counts) > 0:
+                current_month_label = month_case_counts.index[-1]
+                current_count = int(month_case_counts.iloc[-1])
+                if len(month_case_counts) >= 2:
+                    prev_month = month_case_counts.index[-2]
+                    prev_count = int(month_case_counts.iloc[-2])
+                    abs_change = current_count - prev_count
+                    pct_change = (abs_change / prev_count * 100) if prev_count else np.nan
+                    if pd.notna(pct_change):
+                        delta_text = f"{abs_change:+,} ({pct_change:+.1f}%) vs {prev_month}"
+
+            bucket_order = ["1-4 days", "5-7 days", "7+ days"]
+            color_map = {
+                "1-4 days": "#2E7D32",
+                "5-7 days": "#FB8C00",
+                "7+ days": "#D32F2F",
+            }
+            bucket_counts = (
+                tab1_completed["TAT_Bucket"]
+                .value_counts()
+                .reindex(bucket_order, fill_value=0)
+            )
+            total_bucket_cases = int(bucket_counts.sum())
 
             tile1, tile2 = st.columns(2)
             with tile1:
-                mean_tat = tab1_completed["TAT_Days"].mean()
-                st.metric(
-                    "Aggregated Mean TAT",
-                    f"{mean_tat:.2f} days" if pd.notna(mean_tat) else "N/A",
-                )
+                with st.container(border=True):
+                    mean_tat_text = f"{mean_tat:.2f} days" if pd.notna(mean_tat) else "N/A"
+                    st.markdown(
+                        f"""
+                        <div class="hero-kpi-title">Aggregated Mean TAT</div>
+                        <div class="hero-kpi-value">{mean_tat_text}</div>
+                        <div class="hero-kpi-sub"><b>Total Number of Cases:</b> {total_cases:,}</div>
+                        <div class="hero-kpi-sub"><b>MoM Change:</b> {delta_text}</div>
+                        <div class="hero-kpi-sub"><b>Reference Month:</b> {current_month_label}</div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
 
             with tile2:
-                current_count = len(tab1_df)
-                delta_text = "No previous month"
-                current_month_label = "Multiple/All"
+                with st.container(border=True):
+                    st.markdown("##### Tat bucket distribution")
+                    if total_bucket_cases <= 0:
+                        st.info("No completed cases available for bucket segmentation.")
+                    else:
+                        segment_df = pd.DataFrame(
+                            {
+                                "TAT_Bucket": bucket_order,
+                                "Count": [int(bucket_counts.get(b, 0)) for b in bucket_order],
+                            }
+                        )
+                        segment_df["Percentage"] = segment_df["Count"] / total_bucket_cases * 100
+                        segment_df["Pct_Text"] = segment_df["Percentage"].map(lambda v: f"{v:.1f}%")
 
-                if len(month_case_counts) > 0:
-                    current_month_label = month_case_counts.index[-1]
-                    current_count = int(month_case_counts.iloc[-1])
-                    if len(month_case_counts) >= 2:
-                        prev_month = month_case_counts.index[-2]
-                        prev_count = int(month_case_counts.iloc[-2])
-                        abs_change = current_count - prev_count
-                        pct_change = (abs_change / prev_count * 100) if prev_count else np.nan
-                        if pd.notna(pct_change):
-                            delta_text = f"{abs_change:+,} ({pct_change:+.1f}%) vs {prev_month}"
-
-                st.metric(
-                    "Total Cases (MoM Change)",
-                    f"{current_count:,}",
-                    delta=delta_text,
-                )
-                st.caption(f"Reference month: {current_month_label}")
+                        fig_segment = go.Figure()
+                        for _, row in segment_df.iterrows():
+                            bucket = row["TAT_Bucket"]
+                            pct = float(row["Percentage"])
+                            fig_segment.add_trace(
+                                go.Bar(
+                                    x=[pct],
+                                    y=[""],
+                                    orientation="h",
+                                    name=bucket,
+                                    marker_color=color_map[bucket],
+                                    text=[f"{pct:.1f}%" if pct > 0 else ""],
+                                    textposition="inside",
+                                    insidetextanchor="middle",
+                                    hovertemplate=f"TAT Bucket: {bucket}<br>Percentage: {pct:.2f}%<extra></extra>",
+                                )
+                            )
+                        fig_segment.update_layout(
+                            barmode="stack",
+                            showlegend=True,
+                            height=220,
+                            margin=dict(l=4, r=4, t=8, b=4),
+                            xaxis_title="",
+                            yaxis_title="",
+                            legend_title_text="TAT Bucket",
+                            paper_bgcolor="rgba(0,0,0,0)",
+                            plot_bgcolor="rgba(0,0,0,0)",
+                        )
+                        fig_segment.update_xaxes(range=[0, 100])
+                        fig_segment.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+                        st.plotly_chart(fig_segment, use_container_width=True)
 
             tile3, tile4 = st.columns(2)
             with tile3:
@@ -583,12 +668,6 @@ def render_tab_one(filtered_df):
                 st.metric("Closed Cases", f"{closed_cases:,}")
 
             st.markdown("#### TAT Bucket Distribution Over Time")
-            bucket_order = ["1-4 days", "5-7 days", "7+ days"]
-            color_map = {
-                "1-4 days": "#2E7D32",
-                "5-7 days": "#FB8C00",
-                "7+ days": "#D32F2F",
-            }
             monthly_bucket = (
                 tab1_completed.dropna(subset=["Month_Str", "TAT_Bucket"])
                 .groupby(["Month_Str", "TAT_Bucket"])
@@ -613,12 +692,6 @@ def render_tab_one(filtered_df):
                 st.plotly_chart(fig_bucket_time, use_container_width=True)
 
             st.markdown("#### Bucket Summary (Count and Percentage)")
-            bucket_order = ["1-4 days", "5-7 days", "7+ days"]
-            bucket_counts = (
-                tab1_completed["TAT_Bucket"]
-                .value_counts()
-                .reindex(bucket_order, fill_value=0)
-            )
             bucket_df = bucket_counts.reset_index()
             bucket_df.columns = ["TAT_Bucket", "Count"]
             total_bucket = bucket_df["Count"].sum()
@@ -632,13 +705,11 @@ def render_tab_one(filtered_df):
 
             st.markdown("#### On-Hold Reason Impact in Days")
             reason_impact = build_hold_reason_impact(tab1_df)
-            metric_cols = st.columns(3)
-            unique_reasons = int(reason_impact["onHoldReasonDescription"].nunique()) if not reason_impact.empty else 0
+            metric_cols = st.columns(2)
             total_reason_instances = int(reason_impact["Count"].sum()) if not reason_impact.empty else 0
             total_hold_days = float(reason_impact["Total_Hold_Days"].sum()) if not reason_impact.empty else 0.0
-            metric_cols[0].metric("Total On-Hold Reasons", f"{unique_reasons:,}")
-            metric_cols[1].metric("Total On-Hold Reason Occurrences", f"{total_reason_instances:,}")
-            metric_cols[2].metric("Total Hold Days Added/Taken", f"{total_hold_days:,.2f}")
+            metric_cols[0].metric("Total On-Hold Reason Occurrences", f"{total_reason_instances:,}")
+            metric_cols[1].metric("Total Hold Days Added/Taken", f"{total_hold_days:,.2f}")
 
             if reason_impact.empty:
                 st.info("No on-hold reason day contribution data available.")
@@ -660,21 +731,18 @@ def render_tab_one(filtered_df):
                 top_cols[1].metric("Max TAT", f"{high_tat['TAT_Days'].max():.1f} days")
                 top_cols[2].metric("Avg Holds", f"{high_tat['Hold_Count'].mean():.2f}")
 
-                sub_cols = st.columns(2)
-                with sub_cols[0]:
-                    build_top_table_with_tat(
-                        high_tat,
-                        ["onHoldReasonDescription", "PrimaryHoldReason"],
-                        "Top 5 onHoldReasonDescription",
-                    )
-                    build_top_table(high_tat, ["lineOfBusinessDescription"], "Top 5 lineOfBusinessDescription")
-                with sub_cols[1]:
-                    build_top_table_with_tat(
-                        high_tat,
-                        ["bgiDescription"],
-                        "Top 5 bgiDescription",
-                    )
-                    build_top_table(high_tat, ["AgentBrokerStateCode"], "Top 5 AgentBrokerStateCode")
+                build_top_table_with_tat(
+                    high_tat,
+                    ["onHoldReasonDescription", "PrimaryHoldReason"],
+                    "Top 5 onHoldReasonDescription",
+                )
+                build_top_table_with_tat(
+                    high_tat,
+                    ["bgiDescription"],
+                    "Top 5 bgiDescription",
+                )
+                build_top_table(high_tat, ["lineOfBusinessDescription"], "Top 5 lineOfBusinessDescription")
+                build_top_table(high_tat, ["AgentBrokerStateCode"], "Top 5 AgentBrokerStateCode")
 
                 st.subheader("Top 5 High TAT Cases (Decreasing Order)")
                 state_col = resolve_column(high_tat, ["AgentBrokerStateCode"])
@@ -713,32 +781,36 @@ def render_tab_two(filtered_df, completed_df):
     if not monthly_holds.empty:
         trend_col, heat_col = st.columns(2)
         with trend_col:
-            fig_holds_trend = px.line(
-                monthly_holds,
-                x="Month_Str",
-                y="Avg_Holds",
-                color="TAT_Bucket",
-                markers=True,
-                title="Average Number of Holds Over Time by TAT Bucket",
-            )
-            fig_holds_trend.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_holds_trend, use_container_width=True)
+            with st.container(border=True):
+                st.markdown("### Holds Trend by TAT Bucket")
+                fig_holds_trend = px.line(
+                    monthly_holds,
+                    x="Month_Str",
+                    y="Avg_Holds",
+                    color="TAT_Bucket",
+                    markers=True,
+                    title="Average Number of Holds Over Time by TAT Bucket",
+                )
+                fig_holds_trend.update_xaxes(tickangle=45)
+                st.plotly_chart(fig_holds_trend, use_container_width=True)
 
         with heat_col:
-            pivot = monthly_holds.pivot(
-                index="TAT_Bucket", columns="Month_Str", values="Avg_Holds"
-            )
-            pivot = pivot.reindex(["1-4 days", "5-7 days", "7+ days"])
+            with st.container(border=True):
+                st.markdown("### Holds Distribution Heatmap")
+                pivot = monthly_holds.pivot(
+                    index="TAT_Bucket", columns="Month_Str", values="Avg_Holds"
+                )
+                pivot = pivot.reindex(["1-4 days", "5-7 days", "7+ days"])
 
-            fig_heat = px.imshow(
-                pivot,
-                text_auto=".2f",
-                aspect="auto",
-                color_continuous_scale="YlOrRd",
-                title="Holds Distribution Over TAT Buckets by Month",
-                labels=dict(x="Month", y="TAT Bucket", color="Avg Holds"),
-            )
-            st.plotly_chart(fig_heat, use_container_width=True)
+                fig_heat = px.imshow(
+                    pivot,
+                    text_auto=".2f",
+                    aspect="auto",
+                    color_continuous_scale="YlOrRd",
+                    title="Holds Distribution Over TAT Buckets by Month",
+                    labels=dict(x="Month", y="TAT Bucket", color="Avg Holds"),
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
     else:
         st.info("Not enough completed case data for hold-vs-TAT monthly distribution.")
 
@@ -755,20 +827,21 @@ def render_tab_two(filtered_df, completed_df):
 
     reason_col1, reason_col2 = st.columns([1.4, 1])
     with reason_col1:
-        st.subheader("On-Hold Cases: Hold Reason Distribution")
-        top_reasons = top_counts(on_hold_cases, reason_col, top_n=15)
-        if top_reasons.empty:
-            st.info("Hold reason column is unavailable.")
-        else:
-            fig_reason = px.bar(
-                top_reasons,
-                x="Value",
-                y="Count",
-                title="Top Hold Reasons (On-Hold Cases)",
-                labels={"Value": "Hold Reason", "Count": "Cases"},
-            )
-            fig_reason.update_xaxes(tickangle=45)
-            st.plotly_chart(fig_reason, use_container_width=True)
+        with st.container(border=True):
+            st.subheader("On-Hold Cases: Hold Reason Distribution")
+            top_reasons = top_counts(on_hold_cases, reason_col, top_n=15)
+            if top_reasons.empty:
+                st.info("Hold reason column is unavailable.")
+            else:
+                fig_reason = px.bar(
+                    top_reasons,
+                    x="Value",
+                    y="Count",
+                    title="Top Hold Reasons (On-Hold Cases)",
+                    labels={"Value": "Hold Reason", "Count": "Cases"},
+                )
+                fig_reason.update_xaxes(tickangle=45)
+                st.plotly_chart(fig_reason, use_container_width=True)
 
     with reason_col2:
         st.subheader("Top Brokers Handling Cases")
