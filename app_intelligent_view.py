@@ -29,6 +29,26 @@ st.markdown(
         color: #5c6770;
         margin-bottom: 1.3rem;
     }
+    div[data-testid="stMetric"] {
+        background: linear-gradient(145deg, #ffffff 0%, #eef5ff 100%);
+        border: 1px solid #cfe0ff;
+        border-radius: 14px;
+        padding: 0.8rem 0.9rem;
+        box-shadow: 0 8px 16px rgba(15, 76, 129, 0.12);
+    }
+    div[data-testid="stMetricLabel"] p {
+        color: #0f4c81;
+        font-weight: 700;
+        letter-spacing: 0.1px;
+    }
+    div[data-testid="stMetricValue"] {
+        color: #0b253a;
+        font-size: 1.7rem;
+        font-weight: 800;
+    }
+    div[data-testid="stMetricDelta"] {
+        font-weight: 650;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -520,6 +540,9 @@ def render_tab_one(filtered_df):
             )
 
             st.markdown("#### KPI Tiles")
+            total_cases = len(tab1_df)
+            st.metric("Total Number of Cases", f"{total_cases:,}")
+
             tile1, tile2 = st.columns(2)
             with tile1:
                 mean_tat = tab1_completed["TAT_Days"].mean()
