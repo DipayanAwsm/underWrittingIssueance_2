@@ -870,7 +870,7 @@ def render_tab_two(filtered_df, completed_df):
             st.dataframe(top_analyst, use_container_width=True, hide_index=True)
 
     with c2:
-        st.subheader("Top raterFullName Taking 7+ TAT Days")
+        st.subheader("Top UnderWriter Taking 7+ TAT Days")
         rater_col = resolve_column(high_tat, ["raterFullName"])
         top_rater = top_counts(high_tat, rater_col, top_n=10)
         if top_rater.empty:
