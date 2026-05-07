@@ -103,6 +103,18 @@ def load_data(file_path_or_buffer):
         return None
 
 
+@st.cache_data
+def dataframe_to_csv_bytes(df):
+    """Convert dataframe to CSV bytes for download."""
+    export_df = df.copy()
+    for list_col in ["Hold_Reasons_List", "Hold_Days_List"]:
+        if list_col in export_df.columns:
+            export_df[list_col] = export_df[list_col].apply(
+                lambda v: "|".join(map(str, v)) if isinstance(v, list) else v
+            )
+    return export_df.to_csv(index=False).encode("utf-8")
+
+
 def parse_separated_values(value):
     """Split values by |, comma-space, or comma."""
     if pd.isna(value):
@@ -691,18 +703,6 @@ def render_tab_one(filtered_df):
                 fig_bucket_time.update_xaxes(tickangle=45)
                 st.plotly_chart(fig_bucket_time, use_container_width=True)
 
-            st.markdown("#### Bucket Summary (Count and Percentage)")
-            bucket_df = bucket_counts.reset_index()
-            bucket_df.columns = ["TAT_Bucket", "Count"]
-            total_bucket = bucket_df["Count"].sum()
-            bucket_df["Percentage"] = np.where(
-                total_bucket > 0,
-                (bucket_df["Count"] / total_bucket * 100).round(2).astype(str) + "%",
-                "0.00%",
-            )
-
-            st.dataframe(bucket_df, use_container_width=True, hide_index=True)
-
             st.markdown("#### On-Hold Reason Impact in Days")
             reason_impact = build_hold_reason_impact(tab1_df)
             metric_cols = st.columns(2)
@@ -969,6 +969,15 @@ def main():
         return
 
     completed_df = filtered_df[filtered_df["TAT_Days"].notna()].copy()
+
+    st.sidebar.header("CSV Report")
+    report_filename = f"underwriting_filtered_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    st.sidebar.download_button(
+        label="Download Filtered Report (CSV)",
+        data=dataframe_to_csv_bytes(filtered_df),
+        file_name=report_filename,
+        mime="text/csv",
+    )
 
     tab1, tab2 = st.tabs(["Tab 1 - TAT Overview", "Tab 2 - Hold Intelligence"])
 
