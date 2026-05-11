@@ -402,6 +402,27 @@ def top_counts(df, column_name, top_n=5):
     return counts
 
 
+def style_table_one_decimal(df, highlight_ge7_cols=None):
+    styled = df.style
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    if numeric_cols:
+        styled = styled.format({col: "{:.1f}" for col in numeric_cols})
+
+    if highlight_ge7_cols:
+        for col in highlight_ge7_cols:
+            if col in df.columns:
+                styled = styled.apply(
+                    lambda s: [
+                        "background-color: #D32F2F; color: #FFFFFF; font-weight: 700;"
+                        if pd.notna(v) and float(v) >= 7
+                        else ""
+                        for v in s
+                    ],
+                    subset=[col],
+                )
+    return styled
+
+
 def build_top_table(df, col_candidates, title, top_n=5):
     col_name = resolve_column(df, col_candidates)
     table = top_counts(df, col_name, top_n=top_n)
@@ -409,7 +430,7 @@ def build_top_table(df, col_candidates, title, top_n=5):
     if table.empty:
         st.info("Column not available in current data.")
     else:
-        st.dataframe(table, use_container_width=True, hide_index=True)
+        st.dataframe(style_table_one_decimal(table), use_container_width=True, hide_index=True)
 
 
 def build_top_table_with_tat(df, col_candidates, title, top_n=5):
@@ -438,9 +459,9 @@ def build_top_table_with_tat(df, col_candidates, title, top_n=5):
         .head(top_n)
     )
 
-    grouped["Avg_TAT_Days"] = grouped["Avg_TAT_Days"].round(2)
     grouped = grouped.rename(columns={"_group_val": "Value"})
-    st.dataframe(grouped, use_container_width=True, hide_index=True)
+    styled_grouped = style_table_one_decimal(grouped, highlight_ge7_cols=["Avg_TAT_Days"])
+    st.dataframe(styled_grouped, use_container_width=True, hide_index=True)
 
 
 def build_hold_reason_impact(df):
@@ -475,8 +496,8 @@ def build_hold_reason_impact(df):
         .reset_index()
         .sort_values("Total_Hold_Days", ascending=False)
     )
-    impact_df["Total_Hold_Days"] = impact_df["Total_Hold_Days"].round(2)
-    impact_df["Avg_Hold_Days"] = impact_df["Avg_Hold_Days"].round(2)
+    impact_df["Total_Hold_Days"] = impact_df["Total_Hold_Days"].round(1)
+    impact_df["Avg_Hold_Days"] = impact_df["Avg_Hold_Days"].round(1)
     return impact_df
 
 
@@ -524,7 +545,7 @@ def show_tat_bucket_distribution(completed_df):
     fig.update_layout(showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.dataframe(bucket_df, use_container_width=True, hide_index=True)
+    st.dataframe(style_table_one_decimal(bucket_df), use_container_width=True, hide_index=True)
 
 
 def show_monthly_tat_buckets(completed_df):
@@ -570,7 +591,6 @@ def render_tab_one(filtered_df):
     with left_col:
         with st.container(border=True):
             st.markdown("### TAT Overview")
-            st.caption("Month-wise filter is applied from the left sidebar with other filters.")
             month_case_counts = (
                 filtered_df.dropna(subset=["Month_Str"])
                 .groupby("Month_Str")
@@ -578,9 +598,11 @@ def render_tab_one(filtered_df):
                 .sort_index()
             )
 
-            st.markdown("#### KPI Tiles")
             mean_tat = tab1_completed["TAT_Days"].mean()
             total_cases = len(tab1_df)
+            avg_touches = tab1_df["Hold_Count"].mean()
+            open_cases = int(tab1_df["completedDateTime"].isna().sum())
+            closed_cases = int(tab1_df["completedDateTime"].notna().sum())
 
             current_count = len(tab1_df)
             delta_text = "No previous month"
@@ -609,75 +631,66 @@ def render_tab_one(filtered_df):
             )
             total_bucket_cases = int(bucket_counts.sum())
 
-            tile1, tile2 = st.columns(2)
-            with tile1:
-                with st.container(border=True):
-                    mean_tat_text = f"{mean_tat:.2f} days" if pd.notna(mean_tat) else "N/A"
-                    st.markdown(
-                        f"""
-                        <div class="hero-kpi-title">Aggregated Mean TAT</div>
-                        <div class="hero-kpi-value">{mean_tat_text}</div>
-                        <div class="hero-kpi-sub"><b>Total Number of Cases:</b> {total_cases:,}</div>
-                        <div class="hero-kpi-sub"><b>MoM Change:</b> {delta_text}</div>
-                        <div class="hero-kpi-sub"><b>Reference Month:</b> {current_month_label}</div>
-                        """,
-                        unsafe_allow_html=True,
+            kpi_col1, kpi_col2, kpi_col3, kpi_col4 = st.columns(4)
+            kpi_col1.metric(
+                "Aggregated Mean TAT",
+                f"{mean_tat:.1f} days" if pd.notna(mean_tat) else "N/A",
+            )
+            kpi_col2.metric(
+                "Avg Touches",
+                f"{avg_touches:.1f}" if pd.notna(avg_touches) else "N/A",
+            )
+            kpi_col3.metric("Open Cases", f"{open_cases:,}")
+            kpi_col4.metric("Closed Cases", f"{closed_cases:,}")
+            st.caption(
+                f"Total Number of Cases: {total_cases:,} | MoM Change: {delta_text} | Reference Month: {current_month_label}"
+            )
+
+            with st.container(border=True):
+                st.markdown("##### Tat bucket distribution")
+                if total_bucket_cases <= 0:
+                    st.info("No completed cases available for bucket segmentation.")
+                else:
+                    segment_df = pd.DataFrame(
+                        {
+                            "TAT_Bucket": bucket_order,
+                            "Count": [int(bucket_counts.get(b, 0)) for b in bucket_order],
+                        }
                     )
+                    segment_df["Percentage"] = segment_df["Count"] / total_bucket_cases * 100
+                    segment_df["Pct_Text"] = segment_df["Percentage"].map(lambda v: f"{v:.1f}%")
 
-            with tile2:
-                with st.container(border=True):
-                    st.markdown("##### Tat bucket distribution")
-                    if total_bucket_cases <= 0:
-                        st.info("No completed cases available for bucket segmentation.")
-                    else:
-                        segment_df = pd.DataFrame(
-                            {
-                                "TAT_Bucket": bucket_order,
-                                "Count": [int(bucket_counts.get(b, 0)) for b in bucket_order],
-                            }
-                        )
-                        segment_df["Percentage"] = segment_df["Count"] / total_bucket_cases * 100
-                        segment_df["Pct_Text"] = segment_df["Percentage"].map(lambda v: f"{v:.1f}%")
-
-                        fig_segment = go.Figure()
-                        for _, row in segment_df.iterrows():
-                            bucket = row["TAT_Bucket"]
-                            pct = float(row["Percentage"])
-                            fig_segment.add_trace(
-                                go.Bar(
-                                    x=[pct],
-                                    y=[""],
-                                    orientation="h",
-                                    name=bucket,
-                                    marker_color=color_map[bucket],
-                                    text=[f"{pct:.1f}%" if pct > 0 else ""],
-                                    textposition="inside",
-                                    insidetextanchor="middle",
-                                    hovertemplate=f"TAT Bucket: {bucket}<br>Percentage: {pct:.2f}%<extra></extra>",
-                                )
+                    fig_segment = go.Figure()
+                    for _, row in segment_df.iterrows():
+                        bucket = row["TAT_Bucket"]
+                        pct = float(row["Percentage"])
+                        fig_segment.add_trace(
+                            go.Bar(
+                                x=[pct],
+                                y=[""],
+                                orientation="h",
+                                name=bucket,
+                                marker_color=color_map[bucket],
+                                text=[f"{pct:.1f}%" if pct > 0 else ""],
+                                textposition="inside",
+                                insidetextanchor="middle",
+                                hovertemplate=f"TAT Bucket: {bucket}<br>Percentage: {pct:.2f}%<extra></extra>",
                             )
-                        fig_segment.update_layout(
-                            barmode="stack",
-                            showlegend=True,
-                            height=220,
-                            margin=dict(l=4, r=4, t=8, b=4),
-                            xaxis_title="",
-                            yaxis_title="",
-                            legend_title_text="TAT Bucket",
-                            paper_bgcolor="rgba(0,0,0,0)",
-                            plot_bgcolor="rgba(0,0,0,0)",
                         )
-                        fig_segment.update_xaxes(range=[0, 100])
-                        fig_segment.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
-                        st.plotly_chart(fig_segment, use_container_width=True)
-
-            tile3, tile4 = st.columns(2)
-            with tile3:
-                open_cases = int(tab1_df["completedDateTime"].isna().sum())
-                st.metric("Open Cases", f"{open_cases:,}")
-            with tile4:
-                closed_cases = int(tab1_df["completedDateTime"].notna().sum())
-                st.metric("Closed Cases", f"{closed_cases:,}")
+                    fig_segment.update_layout(
+                        barmode="stack",
+                        showlegend=True,
+                        height=220,
+                        margin=dict(l=4, r=4, t=8, b=4),
+                        xaxis_title="",
+                        yaxis_title="",
+                        legend_title_text="TAT Bucket",
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                    )
+                    fig_segment.update_xaxes(range=[0, 100])
+                    fig_segment.update_yaxes(showticklabels=False, showgrid=False, zeroline=False)
+                    st.plotly_chart(fig_segment, use_container_width=True)
 
             st.markdown("#### TAT Bucket Distribution Over Time")
             monthly_bucket = (
@@ -708,13 +721,17 @@ def render_tab_one(filtered_df):
             metric_cols = st.columns(2)
             total_reason_instances = int(reason_impact["Count"].sum()) if not reason_impact.empty else 0
             total_hold_days = float(reason_impact["Total_Hold_Days"].sum()) if not reason_impact.empty else 0.0
-            metric_cols[0].metric("Total On-Hold Reason Occurrences", f"{total_reason_instances:,}")
-            metric_cols[1].metric("Total Hold Days Added/Taken", f"{total_hold_days:,.2f}")
+            metric_cols[0].metric("Total On-Hold Reason Occurrences", f"{total_reason_instances:,.1f}")
+            metric_cols[1].metric("Total Hold Days Added/Taken", f"{total_hold_days:,.1f}")
 
             if reason_impact.empty:
                 st.info("No on-hold reason day contribution data available.")
             else:
-                st.dataframe(reason_impact.head(10), use_container_width=True, hide_index=True)
+                styled_reason_impact = style_table_one_decimal(
+                    reason_impact.head(10),
+                    highlight_ge7_cols=["Avg_Hold_Days"],
+                )
+                st.dataframe(styled_reason_impact, use_container_width=True, hide_index=True)
 
     with right_col:
         with st.container(border=True):
@@ -729,7 +746,7 @@ def render_tab_one(filtered_df):
                 top_cols = st.columns(3)
                 top_cols[0].metric("7+ Day Cases", f"{len(high_tat):,}")
                 top_cols[1].metric("Max TAT", f"{high_tat['TAT_Days'].max():.1f} days")
-                top_cols[2].metric("Avg Holds", f"{high_tat['Hold_Count'].mean():.2f}")
+                top_cols[2].metric("Average TAT for 7+ TAT", f"{high_tat['TAT_Days'].mean():.1f} days")
 
                 build_top_table_with_tat(
                     high_tat,
@@ -741,8 +758,16 @@ def render_tab_one(filtered_df):
                     ["bgiDescription"],
                     "Top 5 bgiDescription",
                 )
-                build_top_table(high_tat, ["lineOfBusinessDescription"], "Top 5 lineOfBusinessDescription")
-                build_top_table(high_tat, ["AgentBrokerStateCode"], "Top 5 AgentBrokerStateCode")
+                build_top_table_with_tat(
+                    high_tat,
+                    ["lineOfBusinessDescription"],
+                    "Top 5 lineOfBusinessDescription",
+                )
+                build_top_table_with_tat(
+                    high_tat,
+                    ["AgentBrokerStateCode"],
+                    "Top 5 AgentBrokerStateCode",
+                )
 
                 st.subheader("Top 5 High TAT Cases (Decreasing Order)")
                 state_col = resolve_column(high_tat, ["AgentBrokerStateCode"])
@@ -758,7 +783,7 @@ def render_tab_one(filtered_df):
                         state_col: "AgentBrokerStateCode",
                     }
                     case_table = case_table.rename(columns=rename_map)
-                    st.dataframe(case_table, use_container_width=True, hide_index=True)
+                    st.dataframe(style_table_one_decimal(case_table), use_container_width=True, hide_index=True)
                 else:
                     st.info("Required columns for high-TAT case listing are unavailable.")
 
@@ -844,39 +869,45 @@ def render_tab_two(filtered_df, completed_df):
                 st.plotly_chart(fig_reason, use_container_width=True)
 
     with reason_col2:
-        st.subheader("Top Brokers Handling Cases")
-        broker_name_col = resolve_column(
-            filtered_df,
-            ["AgentBrokerName", "AgentBrokerName__2", "agentBrokerNum"],
-        )
-        top_brokers = top_counts(filtered_df, broker_name_col, top_n=10)
-        if top_brokers.empty:
-            st.info("Broker column unavailable.")
-        else:
-            st.dataframe(top_brokers, use_container_width=True, hide_index=True)
+        with st.container(border=True):
+            build_top_table_with_tat(
+                filtered_df,
+                ["AgentBrokerName", "AgentBrokerName__2", "agentBrokerNum"],
+                "Top Brokers Handling Cases",
+                top_n=10,
+            )
 
     st.markdown("---")
 
-    # (c) Top accountAnalyst and raterFullName taking 7+ days
+    # (c) Top accountAnalyst, UnderWriter, and raterFullName taking 7+ days
     high_tat = completed_df[completed_df["TAT_Bucket"] == "7+ days"].copy()
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("Top accountAnalyst Taking 7+ TAT Days")
-        analyst_col = resolve_column(high_tat, ["accountAnalyst", "accountAnalystName"])
-        top_analyst = top_counts(high_tat, analyst_col, top_n=10)
-        if top_analyst.empty:
-            st.info("accountAnalyst column unavailable.")
-        else:
-            st.dataframe(top_analyst, use_container_width=True, hide_index=True)
+        with st.container(border=True):
+            build_top_table_with_tat(
+                high_tat,
+                ["accountAnalyst", "accountAnalystName"],
+                "Top accountAnalyst Taking 7+ TAT Days",
+                top_n=10,
+            )
 
     with c2:
-        st.subheader("Top UnderWriter Taking 7+ TAT Days")
-        rater_col = resolve_column(high_tat, ["raterFullName"])
-        top_rater = top_counts(high_tat, rater_col, top_n=10)
-        if top_rater.empty:
-            st.info("raterFullName column unavailable.")
-        else:
-            st.dataframe(top_rater, use_container_width=True, hide_index=True)
+        with st.container(border=True):
+            build_top_table_with_tat(
+                high_tat,
+                ["underwriterName", "underwriter"],
+                "Top UnderWriter Taking 7+ TAT Days",
+                top_n=10,
+            )
+
+    with c3:
+        with st.container(border=True):
+            build_top_table_with_tat(
+                high_tat,
+                ["raterFullName"],
+                "Top raterFullName Taking 7+ TAT Days",
+                top_n=10,
+            )
 
     st.markdown("---")
 
@@ -910,7 +941,7 @@ def render_tab_two(filtered_df, completed_df):
             }
             high_tat_lm = high_tat_lm.rename(columns=rename_map)
             st.caption(f"Last month in filtered data: {last_month}")
-            st.dataframe(high_tat_lm, use_container_width=True, hide_index=True)
+            st.dataframe(style_table_one_decimal(high_tat_lm), use_container_width=True, hide_index=True)
         else:
             st.info("Requested case-level columns not available.")
 
@@ -924,7 +955,7 @@ def render_tab_two(filtered_df, completed_df):
     else:
         reason_summary["Recommended Action"] = reason_summary["Value"].apply(suggest_action_for_reason)
         reason_summary = reason_summary.rename(columns={"Value": "onHoldReasonDescription"})
-        st.dataframe(reason_summary, use_container_width=True, hide_index=True)
+        st.dataframe(style_table_one_decimal(reason_summary), use_container_width=True, hide_index=True)
 
 
 def main():
