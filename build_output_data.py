@@ -1,0 +1,376 @@
+"""Build reusable underwriting output datasets for Streamlit and Power BI.
+
+Usage:
+  python build_output_data.py --input data/auto_issuance_synthetic_1year_10000rows.csv --output output
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import warnings
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+
+def load_data(input_path: str | Path) -> pd.DataFrame:
+    input_path = str(input_path)
+    if input_path.endswith(".csv"):
+        return pd.read_csv(input_path, low_memory=False)
+    if input_path.endswith((".xlsx", ".xls")):
+        return pd.read_excel(input_path, engine="openpyxl")
+    raise ValueError(f"Unsupported input format: {input_path}")
+
+
+def parse_separated_values(value) -> list[str]:
+    if pd.isna(value):
+        return []
+
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if "|" in text:
+        parts = text.split("|")
+    elif ", " in text:
+        parts = text.split(", ")
+    elif "," in text:
+        parts = text.split(",")
+    else:
+        return [text]
+
+    return [p.strip() for p in parts if str(p).strip()]
+
+
+def resolve_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    for col in candidates:
+        if col in df.columns:
+            return col
+    return None
+
+
+def infer_case_type(hold_count: float) -> str:
+    if hold_count <= 0:
+        return "Straight Through"
+    if hold_count == 1:
+        return "One Touch"
+    return f"Multi Hold ({int(hold_count)} touches)"
+
+
+def create_tat_bucket(tat_days: float | int | None) -> str | None:
+    if pd.isna(tat_days):
+        return None
+    if tat_days <= 4:
+        return "1-4 days"
+    if tat_days <= 7:
+        return "5-7 days"
+    return "7+ days"
+
+
+def to_float_series(series: pd.Series) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce")
+
+
+def parse_datetime_series(series: pd.Series) -> pd.Series:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        parsed_dayfirst = pd.to_datetime(series, errors="coerce", dayfirst=True)
+        parsed_default = pd.to_datetime(series, errors="coerce")
+
+    if parsed_dayfirst.notna().sum() > parsed_default.notna().sum():
+        return parsed_dayfirst
+    return parsed_default
+
+
+def parse_datetime_value(value):
+    if pd.isna(value):
+        return pd.NaT
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        dt_dayfirst = pd.to_datetime(value, errors="coerce", dayfirst=True)
+        dt_default = pd.to_datetime(value, errors="coerce")
+    if pd.notna(dt_dayfirst):
+        return dt_dayfirst
+    return dt_default
+
+
+def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+    data = df.copy()
+
+    create_col = resolve_column(data, ["createDateTime"])
+    complete_col = resolve_column(data, ["completedDateTime"])
+    tat_col = resolve_column(data, ["TAT", "Tat", "tat"])
+    holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
+    history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
+    hold_reason_col = resolve_column(data, ["onHoldReasonDescription"])
+    on_hold_dates_col = resolve_column(data, ["onHoldDatesHistory"])
+    off_hold_dates_col = resolve_column(data, ["offHoldDatesHistory"])
+
+    if create_col:
+        data["createDateTime"] = parse_datetime_series(data[create_col])
+    else:
+        data["createDateTime"] = pd.NaT
+
+    if complete_col:
+        data["completedDateTime"] = parse_datetime_series(data[complete_col])
+    else:
+        data["completedDateTime"] = pd.NaT
+
+    tat_from_dates = (data["completedDateTime"] - data["createDateTime"]).dt.total_seconds() / 86400.0
+
+    if tat_col:
+        fallback_tat = to_float_series(data[tat_col])
+        data["TAT_Days"] = tat_from_dates.where(tat_from_dates.notna(), fallback_tat)
+    else:
+        data["TAT_Days"] = tat_from_dates
+
+    data.loc[data["TAT_Days"] < 0, "TAT_Days"] = np.nan
+
+    hold_counts = pd.Series(0, index=data.index, dtype="float64")
+    if history_reason_col:
+        hold_counts = data[history_reason_col].apply(lambda v: len(parse_separated_values(v))).astype("float64")
+
+    if holds_col:
+        numeric_holds = to_float_series(data[holds_col])
+        hold_counts = hold_counts.where(hold_counts > 0, numeric_holds)
+
+    if hold_reason_col:
+        has_single_hold_reason = data[hold_reason_col].fillna("").astype(str).str.strip().ne("")
+        hold_counts = hold_counts.where(hold_counts > 0, has_single_hold_reason.astype(int))
+
+    data["Hold_Count"] = hold_counts.fillna(0).clip(lower=0)
+    data["CaseType"] = data["Hold_Count"].apply(infer_case_type)
+    data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
+
+    hold_reasons_list = []
+    hold_days_list = []
+    now_ts = pd.Timestamp.now()
+
+    for _, row in data.iterrows():
+        reasons = parse_separated_values(row.get(history_reason_col, "")) if history_reason_col else []
+        if not reasons and hold_reason_col:
+            primary_reason = row.get(hold_reason_col, "")
+            if pd.notna(primary_reason) and str(primary_reason).strip():
+                reasons = [str(primary_reason).strip()]
+
+        on_hold_raw = parse_separated_values(row.get(on_hold_dates_col, "")) if on_hold_dates_col else []
+        off_hold_raw = parse_separated_values(row.get(off_hold_dates_col, "")) if off_hold_dates_col else []
+
+        on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
+        on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
+        off_hold_dates = [parse_datetime_value(v) for v in off_hold_raw]
+        off_hold_dates = [d for d in off_hold_dates if pd.notna(d)]
+
+        aligned_reasons = []
+        aligned_days = []
+        event_count = max(len(reasons), len(on_hold_dates))
+
+        for idx in range(event_count):
+            on_dt = on_hold_dates[idx] if idx < len(on_hold_dates) else pd.NaT
+            if pd.isna(on_dt):
+                continue
+
+            reason_val = reasons[idx] if idx < len(reasons) else (reasons[-1] if reasons else "Unknown")
+            reason_val = str(reason_val).strip() if str(reason_val).strip() else "Unknown"
+
+            off_dt = off_hold_dates[idx] if idx < len(off_hold_dates) else pd.NaT
+            if pd.notna(off_dt):
+                end_dt = off_dt
+            elif pd.notna(row.get("completedDateTime")):
+                end_dt = row.get("completedDateTime")
+            else:
+                end_dt = now_ts
+
+            days = (end_dt - on_dt).total_seconds() / 86400.0
+            if pd.notna(days) and days >= 0:
+                aligned_reasons.append(reason_val)
+                aligned_days.append(float(days))
+
+        hold_reasons_list.append(aligned_reasons)
+        hold_days_list.append(aligned_days)
+
+    data["Hold_Reasons_List"] = hold_reasons_list
+    data["Hold_Days_List"] = hold_days_list
+    data["Total_Hold_Days"] = data["Hold_Days_List"].apply(lambda v: float(np.sum(v)) if v else 0.0)
+
+    data["Month"] = data["createDateTime"].dt.to_period("M")
+    data["Month_Str"] = data["Month"].astype(str)
+    data.loc[data["createDateTime"].isna(), "Month_Str"] = np.nan
+
+    if hold_reason_col:
+        data["PrimaryHoldReason"] = data[hold_reason_col].fillna("Unknown").astype(str)
+    elif history_reason_col:
+        data["PrimaryHoldReason"] = data[history_reason_col].apply(
+            lambda v: parse_separated_values(v)[0] if parse_separated_values(v) else "Unknown"
+        )
+    else:
+        data["PrimaryHoldReason"] = "Unknown"
+
+    return data
+
+
+def build_hold_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
+    request_col = resolve_column(prepared_df, ["requestId"])
+    process_col = resolve_column(prepared_df, ["processId"])
+
+    records = []
+    for idx, row in prepared_df.iterrows():
+        reasons = row.get("Hold_Reasons_List", [])
+        days_list = row.get("Hold_Days_List", [])
+
+        if not isinstance(reasons, list) or not isinstance(days_list, list):
+            continue
+
+        for i, reason in enumerate(reasons):
+            if i >= len(days_list):
+                continue
+            hold_days = days_list[i]
+            if pd.isna(hold_days):
+                continue
+
+            records.append(
+                {
+                    "row_index": int(idx),
+                    "requestId": row.get(request_col) if request_col else None,
+                    "processId": row.get(process_col) if process_col else None,
+                    "Month_Str": row.get("Month_Str"),
+                    "TAT_Days": row.get("TAT_Days"),
+                    "TAT_Bucket": row.get("TAT_Bucket"),
+                    "Hold_Count": row.get("Hold_Count"),
+                    "onHoldReasonDescription": reason,
+                    "Hold_Days": float(hold_days),
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
+def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
+    high_tat_df = completed_df[completed_df["TAT_Bucket"] == "7+ days"].copy()
+
+    hold_events_df = build_hold_events(prepared_df)
+
+    monthly_tat_bucket = (
+        completed_df.dropna(subset=["Month_Str", "TAT_Bucket"])
+        .groupby(["Month_Str", "TAT_Bucket"]) 
+        .size()
+        .reset_index(name="Count")
+        .sort_values("Month_Str")
+    )
+
+    monthly_holds_by_tat_bucket = (
+        completed_df.dropna(subset=["Month_Str", "TAT_Bucket"])
+        .groupby(["Month_Str", "TAT_Bucket"]) 
+        .agg(Avg_Holds=("Hold_Count", "mean"), Cases=("TAT_Days", "size"))
+        .reset_index()
+        .sort_values("Month_Str")
+    )
+
+    hold_reason_impact = pd.DataFrame(columns=["onHoldReasonDescription", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
+    if not hold_events_df.empty:
+        hold_reason_impact = (
+            hold_events_df.groupby("onHoldReasonDescription")
+            .agg(Count=("Hold_Days", "size"), Total_Hold_Days=("Hold_Days", "sum"), Avg_Hold_Days=("Hold_Days", "mean"))
+            .reset_index()
+            .sort_values("Total_Hold_Days", ascending=False)
+        )
+
+    def top_with_avg_tat(df: pd.DataFrame, col_candidates: list[str], top_n: int = 10) -> pd.DataFrame:
+        col = resolve_column(df, col_candidates)
+        if col is None or col not in df.columns:
+            return pd.DataFrame(columns=["Value", "Number_of_Cases", "Avg_TAT_Days"])
+        out = (
+            df.assign(Value=df[col].fillna("Unknown").astype(str).str.strip().replace("", "Unknown"))
+            .groupby("Value")
+            .agg(Number_of_Cases=("TAT_Days", "size"), Avg_TAT_Days=("TAT_Days", "mean"))
+            .reset_index()
+            .sort_values("Number_of_Cases", ascending=False)
+            .head(top_n)
+        )
+        return out
+
+    top_brokers = top_with_avg_tat(prepared_df, ["AgentBrokerName", "AgentBrokerName__2", "agentBrokerNum"], top_n=10)
+    top_account_analyst_7plus = top_with_avg_tat(high_tat_df, ["accountAnalyst", "accountAnalystName"], top_n=10)
+    top_underwriter_7plus = top_with_avg_tat(high_tat_df, ["underwriterName", "underwriter"], top_n=10)
+    top_rater_7plus = top_with_avg_tat(high_tat_df, ["raterFullName"], top_n=10)
+
+    top_7plus_hold_reason = top_with_avg_tat(high_tat_df, ["onHoldReasonDescription", "PrimaryHoldReason"], top_n=5)
+    top_7plus_bgi = top_with_avg_tat(high_tat_df, ["bgiDescription"], top_n=5)
+    top_7plus_lob = top_with_avg_tat(high_tat_df, ["lineOfBusinessDescription"], top_n=5)
+    top_7plus_state = top_with_avg_tat(high_tat_df, ["AgentBrokerStateCode"], top_n=5)
+
+    tables = {
+        "fact_cases": prepared_df,
+        "fact_hold_events": hold_events_df,
+        "agg_monthly_tat_bucket": monthly_tat_bucket,
+        "agg_monthly_holds_by_tat_bucket": monthly_holds_by_tat_bucket,
+        "agg_hold_reason_impact": hold_reason_impact,
+        "agg_top_brokers": top_brokers,
+        "agg_top_account_analyst_7plus": top_account_analyst_7plus,
+        "agg_top_underwriter_7plus": top_underwriter_7plus,
+        "agg_top_rater_7plus": top_rater_7plus,
+        "agg_top_7plus_onholdreason": top_7plus_hold_reason,
+        "agg_top_7plus_bgi": top_7plus_bgi,
+        "agg_top_7plus_lob": top_7plus_lob,
+        "agg_top_7plus_state": top_7plus_state,
+    }
+    return tables
+
+
+def write_outputs(tables: dict[str, pd.DataFrame], output_dir: Path) -> dict:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    written_files = []
+    for name, df in tables.items():
+        out_df = df.copy()
+
+        # Serialize list columns to pipe-delimited strings for cross-tool compatibility.
+        for list_col in ["Hold_Reasons_List", "Hold_Days_List"]:
+            if list_col in out_df.columns:
+                out_df[list_col] = out_df[list_col].apply(
+                    lambda v: "|".join(map(str, v)) if isinstance(v, list) else v
+                )
+
+        out_path = output_dir / f"{name}.csv"
+        out_df.to_csv(out_path, index=False)
+        written_files.append({"name": name, "file": out_path.name, "rows": int(len(out_df)), "columns": int(len(out_df.columns))})
+
+    manifest = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "output_dir": str(output_dir.resolve()),
+        "tables": written_files,
+    }
+
+    with open(output_dir / "manifest.json", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2)
+
+    return manifest
+
+
+def run_pipeline(input_path: Path, output_dir: Path) -> dict:
+    source_df = load_data(input_path)
+    prepared_df = prepare_dataframe(source_df)
+    tables = build_output_tables(prepared_df)
+    return write_outputs(tables, output_dir)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build underwriting output data model for Streamlit and Power BI.")
+    parser.add_argument("--input", required=True, help="Input CSV/XLSX file path")
+    parser.add_argument("--output", default="output", help="Output folder path (default: output)")
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    manifest = run_pipeline(Path(args.input), Path(args.output))
+    print("Output created successfully")
+    print(json.dumps(manifest, indent=2))
+
+
+if __name__ == "__main__":
+    main()

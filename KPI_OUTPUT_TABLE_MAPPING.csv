@@ -1,0 +1,28 @@
+tab,section,kpi_or_visual,output_table,usage
+Tab 1 - TAT Overview,KPI Row,Aggregated Mean TAT,fact_cases.csv,Mean of TAT_Days on filtered completed cases
+Tab 1 - TAT Overview,KPI Row,Avg Touches,fact_cases.csv,Mean of Hold_Count on filtered cases
+Tab 1 - TAT Overview,KPI Row,Open Cases,fact_cases.csv,Count where completedDateTime is null
+Tab 1 - TAT Overview,KPI Row,Closed Cases,fact_cases.csv,Count where completedDateTime is not null
+Tab 1 - TAT Overview,KPI Context,Total Number of Cases / MoM Change / Reference Month,fact_cases.csv,Case counts by Month_Str
+Tab 1 - TAT Overview,KPI Tile,Tat bucket distribution,fact_cases.csv,Count by TAT_Bucket and percent share
+Tab 1 - TAT Overview,Trend,TAT Bucket Distribution by Month,agg_monthly_tat_bucket.csv,Month_Str x TAT_Bucket counts
+Tab 1 - TAT Overview,Hold Impact,Total On-Hold Reason Occurrences,agg_hold_reason_impact.csv,Sum of Count
+Tab 1 - TAT Overview,Hold Impact,Total Hold Days Added/Taken,agg_hold_reason_impact.csv,Sum of Total_Hold_Days
+Tab 1 - TAT Overview,Hold Impact,On-Hold Reason Impact table,agg_hold_reason_impact.csv,"Reason level Count, Total_Hold_Days, Avg_Hold_Days"
+Tab 1 - 7+ Days Drilldown,Summary,7+ Day Cases,fact_cases.csv,Count where TAT_Bucket = '7+ days'
+Tab 1 - 7+ Days Drilldown,Summary,Max TAT,fact_cases.csv,Max TAT_Days where TAT_Bucket = '7+ days'
+Tab 1 - 7+ Days Drilldown,Summary,Average TAT for 7+ TAT,fact_cases.csv,Mean TAT_Days where TAT_Bucket = '7+ days'
+Tab 1 - 7+ Days Drilldown,Top 5,Top 5 onHoldReasonDescription (with Avg TAT),agg_top_7plus_onholdreason.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 1 - 7+ Days Drilldown,Top 5,Top 5 bgiDescription (with Avg TAT),agg_top_7plus_bgi.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 1 - 7+ Days Drilldown,Top 5,Top 5 lineOfBusinessDescription (with Avg TAT),agg_top_7plus_lob.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 1 - 7+ Days Drilldown,Top 5,Top 5 AgentBrokerStateCode (with Avg TAT),agg_top_7plus_state.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 1 - 7+ Days Drilldown,Cases,Top 5 High TAT Cases,fact_cases.csv,Sort TAT_Days desc within TAT_Bucket = '7+ days'
+Tab 2 - Hold Intelligence,Trend,Average Number of Holds Over Time by TAT Bucket,agg_monthly_holds_by_tat_bucket.csv,Month_Str x TAT_Bucket with Avg_Holds
+Tab 2 - Hold Intelligence,Heatmap,Holds Distribution Over TAT Buckets by Month,agg_monthly_holds_by_tat_bucket.csv,Pivot Month_Str vs TAT_Bucket using Avg_Holds
+Tab 2 - Hold Intelligence,Distribution,On-Hold Cases: Hold Reason Distribution,fact_cases.csv (or fact_hold_events.csv for event-grain),Count by hold reason on on-hold subset
+Tab 2 - Hold Intelligence,Top 10,Top Brokers Handling Cases (with Avg TAT),agg_top_brokers.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 2 - Hold Intelligence,Top 10,Top accountAnalyst Taking 7+ TAT Days (with Avg TAT),agg_top_account_analyst_7plus.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 2 - Hold Intelligence,Top 10,Top UnderWriter Taking 7+ TAT Days (with Avg TAT),agg_top_underwriter_7plus.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 2 - Hold Intelligence,Top 10,Top raterFullName Taking 7+ TAT Days (with Avg TAT),agg_top_rater_7plus.csv,"Value, Number_of_Cases, Avg_TAT_Days"
+Tab 2 - Hold Intelligence,Cases,Last Month Highest TAT Cases Top 5,fact_cases.csv,"Latest Month_Str, sort by TAT_Days desc"
+Tab 2 - Hold Intelligence,Actions,Top On-Hold Reason + Prescribed Action,fact_cases.csv (or agg_hold_reason_impact.csv),Top reasons then map rule-based action

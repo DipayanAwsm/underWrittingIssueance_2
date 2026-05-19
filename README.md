@@ -624,3 +624,15 @@ This will generate:
 ## Author
 
 Underwriting Issuance Dashboard - Analytics and Reporting Tool
+
+## Shared Output Pipeline (Streamlit + Power BI)
+
+Use the pipeline to generate one consistent output model for both Streamlit and Power BI:
+
+```bash
+python build_output_data.py --input data/auto_issuance_synthetic_1year_10000rows.csv --output output
+```
+
+Then run Streamlit and choose `Processed Output Folder` as data source.
+
+Detailed usage: see `PIPELINE_USAGE.md`.
