@@ -138,7 +138,6 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     complete_col = resolve_column(data, ["completedDateTime"])
     holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
     history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
-    hold_reason_col = resolve_column(data, ["onHoldReasonDescription"])
     on_hold_dates_col = resolve_column(data, ["onHoldDatesHistory"])
     off_hold_dates_col = resolve_column(data, ["offHoldDatesHistory"])
 
@@ -180,10 +179,6 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         numeric_holds = to_float_series(data[holds_col])
         hold_counts = hold_counts.where(hold_counts > 0, numeric_holds)
 
-    if hold_reason_col:
-        has_single_hold_reason = data[hold_reason_col].fillna("").astype(str).str.strip().ne("")
-        hold_counts = hold_counts.where(hold_counts > 0, has_single_hold_reason.astype(int))
-
     data["Hold_Count"] = hold_counts.fillna(0).clip(lower=0)
     data["CaseType"] = data["Hold_Count"].apply(infer_case_type)
     data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
@@ -200,12 +195,7 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         reasons = parse_reason_history_cell(history_text, expected_count=len(on_hold_raw) if on_hold_raw else None)
 
         reasons_for_top = parse_reason_history_cell(history_text, expected_count=None)
-        if not reasons_for_top and hold_reason_col:
-            reasons_for_top = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
         all_hold_reasons_list.append(reasons_for_top)
-
-        if not reasons and hold_reason_col:
-            reasons = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
 
         on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
         on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
@@ -282,7 +272,7 @@ def build_hold_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
                     "TAT_Days": row.get("TAT_Days"),
                     "TAT_Bucket": row.get("TAT_Bucket"),
                     "Hold_Count": row.get("Hold_Count"),
-                    "onHoldReasonDescription": reason,
+                    "onHoldReasonDescriptionsHistory": reason,
                     "Hold_Days": float(hold_days),
                 }
             )
@@ -314,7 +304,7 @@ def build_reason_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
                     "Month_Str": row.get("Month_Str"),
                     "TAT_Days": row.get("TAT_Days"),
                     "TAT_Bucket": row.get("TAT_Bucket"),
-                    "onHoldReasonDescription": reason_text,
+                    "onHoldReasonDescriptionsHistory": reason_text,
                 }
             )
 
@@ -344,10 +334,10 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         .sort_values("Month_Str")
     )
 
-    hold_reason_impact = pd.DataFrame(columns=["onHoldReasonDescription", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
+    hold_reason_impact = pd.DataFrame(columns=["onHoldReasonDescriptionsHistory", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
     if not hold_events_df.empty:
         hold_reason_impact = (
-            hold_events_df.groupby("onHoldReasonDescription")
+            hold_events_df.groupby("onHoldReasonDescriptionsHistory")
             .agg(Count=("Hold_Days", "size"), Total_Hold_Days=("Hold_Days", "sum"), Avg_Hold_Days=("Hold_Days", "mean"))
             .reset_index()
             .sort_values("Total_Hold_Days", ascending=False)
@@ -378,7 +368,7 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         if not reason_7plus.empty:
             top_7plus_hold_reason = (
                 reason_7plus.assign(
-                    Value=reason_7plus["onHoldReasonDescription"]
+                    Value=reason_7plus["onHoldReasonDescriptionsHistory"]
                     .fillna("Unknown")
                     .astype(str)
                     .str.strip()

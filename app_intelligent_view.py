@@ -279,7 +279,6 @@ def prepare_dataframe(df):
     complete_col = resolve_column(data, ["completedDateTime"])
     holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
     history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
-    hold_reason_col = resolve_column(data, ["onHoldReasonDescription"])
     on_hold_dates_col = resolve_column(data, ["onHoldDatesHistory"])
     off_hold_dates_col = resolve_column(data, ["offHoldDatesHistory"])
 
@@ -324,12 +323,6 @@ def prepare_dataframe(df):
         numeric_holds = to_float_series(data[holds_col])
         hold_counts = hold_counts.where(hold_counts > 0, numeric_holds)
 
-    if hold_reason_col:
-        has_single_hold_reason = (
-            data[hold_reason_col].fillna("").astype(str).str.strip().ne("")
-        )
-        hold_counts = hold_counts.where(hold_counts > 0, has_single_hold_reason.astype(int))
-
     data["Hold_Count"] = hold_counts.fillna(0).clip(lower=0)
     data["CaseType"] = data["Hold_Count"].apply(infer_case_type)
     data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
@@ -345,12 +338,7 @@ def prepare_dataframe(df):
         reasons = parse_reason_history_cell(history_text, expected_count=len(on_hold_raw) if on_hold_raw else None)
 
         reasons_for_top = parse_reason_history_cell(history_text, expected_count=None)
-        if not reasons_for_top and hold_reason_col:
-            reasons_for_top = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
         all_hold_reasons_list.append(reasons_for_top)
-
-        if not reasons and hold_reason_col:
-            reasons = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
 
         on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
         on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
@@ -576,7 +564,7 @@ def build_top_hold_reason_with_tat(df, title, top_n=5):
             records.append({"Value": reason_text, "TAT_Days": float(tat)})
 
     if not records:
-        st.info("No onHoldReasonDescription values found.")
+        st.info("No onHoldReasonDescriptionsHistory values found.")
         return
 
     grouped = (
@@ -615,7 +603,7 @@ def top_counts_from_reason_list(df, top_n=15):
 
 def build_hold_reason_impact(df):
     if "Hold_Reasons_List" not in df.columns or "Hold_Days_List" not in df.columns:
-        return pd.DataFrame(columns=["onHoldReasonDescription", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
+        return pd.DataFrame(columns=["onHoldReasonDescriptionsHistory", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
 
     records = []
     for _, row in df.iterrows():
@@ -629,14 +617,14 @@ def build_hold_reason_impact(df):
             day_val = days[idx]
             if pd.isna(day_val):
                 continue
-            records.append({"onHoldReasonDescription": reason, "Hold_Days": float(day_val)})
+            records.append({"onHoldReasonDescriptionsHistory": reason, "Hold_Days": float(day_val)})
 
     if not records:
-        return pd.DataFrame(columns=["onHoldReasonDescription", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
+        return pd.DataFrame(columns=["onHoldReasonDescriptionsHistory", "Count", "Total_Hold_Days", "Avg_Hold_Days"])
 
     reason_df = pd.DataFrame(records)
     impact_df = (
-        reason_df.groupby("onHoldReasonDescription")
+        reason_df.groupby("onHoldReasonDescriptionsHistory")
         .agg(
             Count=("Hold_Days", "size"),
             Total_Hold_Days=("Hold_Days", "sum"),
@@ -899,7 +887,7 @@ def render_tab_one(filtered_df):
 
                 build_top_hold_reason_with_tat(
                     high_tat,
-                    "Top 5 onHoldReasonDescription",
+                    "Top 5 onHoldReasonDescriptionsHistory",
                     top_n=5,
                 )
                 build_top_table_with_tat(
@@ -997,7 +985,7 @@ def render_tab_two(filtered_df, completed_df):
         on_hold_mask = on_hold_mask | filtered_df[status_col].astype(str).str.contains("hold", case=False, na=False)
 
     on_hold_cases = filtered_df[on_hold_mask].copy()
-    reason_col = resolve_column(on_hold_cases, ["onHoldReasonDescription", "PrimaryHoldReason"])
+    reason_col = resolve_column(on_hold_cases, ["onHoldReasonDescriptionsHistory", "PrimaryHoldReason"])
 
     reason_col1, reason_col2 = st.columns([1.4, 1])
     with reason_col1:
@@ -1100,12 +1088,14 @@ def render_tab_two(filtered_df, completed_df):
 
     # (e) Top on-hold reason and suggested actions
     st.subheader("Prescriptive Actions for Top Hold Reasons")
-    reason_summary = top_counts(on_hold_cases, reason_col, top_n=10)
+    reason_summary = top_counts_from_reason_list(on_hold_cases, top_n=10)
+    if reason_summary.empty:
+        reason_summary = top_counts(on_hold_cases, reason_col, top_n=10)
     if reason_summary.empty:
         st.info("Unable to generate hold reason actions because hold reason data is missing.")
     else:
         reason_summary["Recommended Action"] = reason_summary["Value"].apply(suggest_action_for_reason)
-        reason_summary = reason_summary.rename(columns={"Value": "onHoldReasonDescription"})
+        reason_summary = reason_summary.rename(columns={"Value": "onHoldReasonDescriptionsHistory"})
         st.dataframe(style_table_one_decimal(reason_summary), use_container_width=True, hide_index=True)
 
 
