@@ -9,6 +9,10 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+MISSING_TOKENS = {"", "nan", "none", "null", "na", "n/a", "-", "[]"}
+DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+REASON_SKIP_TOKENS = {"unknown", "unspecified"}
+
 
 st.set_page_config(
     page_title="Underwriting Issuance - Intelligent View",
@@ -124,10 +128,11 @@ def load_processed_fact_cases(output_folder="output"):
         if num_col in df.columns:
             df[num_col] = pd.to_numeric(df[num_col], errors="coerce")
 
-    if "Hold_Reasons_List" in df.columns:
-        df["Hold_Reasons_List"] = df["Hold_Reasons_List"].fillna("").apply(
-            lambda s: parse_separated_values(s) if str(s).strip() else []
-        )
+    for reason_col in ["Hold_Reasons_List", "All_Hold_Reasons_List"]:
+        if reason_col in df.columns:
+            df[reason_col] = df[reason_col].fillna("").apply(
+                lambda s: parse_reason_history_cell(s, expected_count=None) if str(s).strip() else []
+            )
 
     if "Hold_Days_List" in df.columns:
         def _to_float_list(value):
@@ -149,7 +154,7 @@ def load_processed_fact_cases(output_folder="output"):
 def dataframe_to_csv_bytes(df):
     """Convert dataframe to CSV bytes for download."""
     export_df = df.copy()
-    for list_col in ["Hold_Reasons_List", "Hold_Days_List"]:
+    for list_col in ["Hold_Reasons_List", "All_Hold_Reasons_List", "Hold_Days_List"]:
         if list_col in export_df.columns:
             export_df[list_col] = export_df[list_col].apply(
                 lambda v: "|".join(map(str, v)) if isinstance(v, list) else v
@@ -157,25 +162,58 @@ def dataframe_to_csv_bytes(df):
     return export_df.to_csv(index=False).encode("utf-8")
 
 
-def parse_separated_values(value):
-    """Split values by |, comma-space, or comma."""
-    if pd.isna(value):
-        return []
+def clean_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip().strip("[]")
+    if not text or text.lower() in MISSING_TOKENS:
+        return ""
+    return text
 
-    text = str(value).strip()
+
+def clean_tokens(tokens):
+    out = []
+    for token in tokens:
+        item = str(token).strip()
+        if not item or item.lower() in MISSING_TOKENS:
+            continue
+        out.append(item)
+    return out
+
+
+def parse_date_history_cell(value: object):
+    text = clean_text(value)
     if not text:
         return []
-
     if "|" in text:
-        parts = text.split("|")
-    elif ", " in text:
-        parts = text.split(", ")
-    elif "," in text:
-        parts = text.split(",")
-    else:
-        return [text]
+        return clean_tokens(text.split("|"))
+    if "," in text:
+        matches = DATE_TOKEN_PATTERN.findall(text)
+        if matches:
+            return clean_tokens(matches)
+        return clean_tokens(re.split(r"\s*,\s*", text))
+    return clean_tokens([text])
 
-    return [p.strip() for p in parts if str(p).strip()]
+
+def parse_reason_history_cell(value: object, expected_count=None):
+    text = clean_text(value)
+    if not text:
+        return []
+    if "|" in text:
+        return clean_tokens(text.split("|"))
+    if "," in text:
+        if expected_count is not None and expected_count <= 1:
+            return clean_tokens([text])
+        parts = clean_tokens(re.split(r"\s*,\s*", text))
+        if expected_count is not None and expected_count > 1 and len(parts) != expected_count:
+            return clean_tokens([text])
+        return parts
+    return clean_tokens([text])
+
+
+def parse_separated_values(value):
+    """Generic parser retained for compatibility."""
+    return parse_reason_history_cell(value, expected_count=None)
 
 
 def resolve_column(df, candidates):
@@ -239,7 +277,6 @@ def prepare_dataframe(df):
 
     create_col = resolve_column(data, ["createDateTime"])
     complete_col = resolve_column(data, ["completedDateTime"])
-    tat_col = resolve_column(data, ["TAT", "Tat", "tat"])
     holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
     history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
     hold_reason_col = resolve_column(data, ["onHoldReasonDescription"])
@@ -259,19 +296,29 @@ def prepare_dataframe(df):
     tat_from_dates = (
         data["completedDateTime"] - data["createDateTime"]
     ).dt.total_seconds() / 86400.0
-
-    if tat_col:
-        fallback_tat = to_float_series(data[tat_col])
-        data["TAT_Days"] = tat_from_dates.where(tat_from_dates.notna(), fallback_tat)
-    else:
-        data["TAT_Days"] = tat_from_dates
+    data["TAT_Days"] = tat_from_dates
 
     data.loc[data["TAT_Days"] < 0, "TAT_Days"] = np.nan
 
     hold_counts = pd.Series(0, index=data.index, dtype="float64")
 
     if history_reason_col:
-        hold_counts = data[history_reason_col].apply(lambda v: len(parse_separated_values(v))).astype("float64")
+        if on_hold_dates_col:
+            hold_counts = data.apply(
+                lambda row: len(
+                    parse_reason_history_cell(
+                        row.get(history_reason_col, ""),
+                        expected_count=(
+                            lambda on_vals: len(on_vals) if on_vals else None
+                        )(parse_date_history_cell(row.get(on_hold_dates_col, ""))),
+                    )
+                ),
+                axis=1,
+            ).astype("float64")
+        else:
+            hold_counts = data[history_reason_col].apply(
+                lambda v: len(parse_reason_history_cell(v, expected_count=None))
+            ).astype("float64")
 
     if holds_col:
         numeric_holds = to_float_series(data[holds_col])
@@ -288,17 +335,22 @@ def prepare_dataframe(df):
     data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
 
     hold_reasons_list = []
+    all_hold_reasons_list = []
     hold_days_list = []
     now_ts = pd.Timestamp.now()
     for _, row in data.iterrows():
-        reasons = parse_separated_values(row.get(history_reason_col, "")) if history_reason_col else []
-        if not reasons and hold_reason_col:
-            primary_reason = row.get(hold_reason_col, "")
-            if pd.notna(primary_reason) and str(primary_reason).strip():
-                reasons = [str(primary_reason).strip()]
+        history_text = row.get(history_reason_col, "") if history_reason_col else ""
+        on_hold_raw = parse_date_history_cell(row.get(on_hold_dates_col, "")) if on_hold_dates_col else []
+        off_hold_raw = parse_date_history_cell(row.get(off_hold_dates_col, "")) if off_hold_dates_col else []
+        reasons = parse_reason_history_cell(history_text, expected_count=len(on_hold_raw) if on_hold_raw else None)
 
-        on_hold_raw = parse_separated_values(row.get(on_hold_dates_col, "")) if on_hold_dates_col else []
-        off_hold_raw = parse_separated_values(row.get(off_hold_dates_col, "")) if off_hold_dates_col else []
+        reasons_for_top = parse_reason_history_cell(history_text, expected_count=None)
+        if not reasons_for_top and hold_reason_col:
+            reasons_for_top = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
+        all_hold_reasons_list.append(reasons_for_top)
+
+        if not reasons and hold_reason_col:
+            reasons = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
 
         on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
         on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
@@ -333,6 +385,7 @@ def prepare_dataframe(df):
         hold_days_list.append(aligned_days)
 
     data["Hold_Reasons_List"] = hold_reasons_list
+    data["All_Hold_Reasons_List"] = all_hold_reasons_list
     data["Hold_Days_List"] = hold_days_list
     data["Total_Hold_Days"] = data["Hold_Days_List"].apply(lambda v: float(np.sum(v)) if v else 0.0)
 
@@ -340,14 +393,9 @@ def prepare_dataframe(df):
     data["Month_Str"] = data["Month"].astype(str)
     data.loc[data["createDateTime"].isna(), "Month_Str"] = np.nan
 
-    if hold_reason_col:
-        data["PrimaryHoldReason"] = data[hold_reason_col].fillna("Unknown").astype(str)
-    elif history_reason_col:
-        data["PrimaryHoldReason"] = data[history_reason_col].apply(
-            lambda v: parse_separated_values(v)[0] if parse_separated_values(v) else "Unknown"
-        )
-    else:
-        data["PrimaryHoldReason"] = "Unknown"
+    data["PrimaryHoldReason"] = data["All_Hold_Reasons_List"].apply(
+        lambda v: v[0] if isinstance(v, list) and v else "Unknown"
+    )
 
     return data
 
@@ -504,6 +552,65 @@ def build_top_table_with_tat(df, col_candidates, title, top_n=5):
     grouped = grouped.rename(columns={"_group_val": "Value"})
     styled_grouped = style_table_one_decimal(grouped, highlight_ge7_cols=["Avg_TAT_Days"])
     st.dataframe(styled_grouped, use_container_width=True, hide_index=True)
+
+
+def build_top_hold_reason_with_tat(df, title, top_n=5):
+    st.subheader(title)
+
+    if "All_Hold_Reasons_List" not in df.columns or "TAT_Days" not in df.columns:
+        st.info("Column not available in current data.")
+        return
+
+    records = []
+    for _, row in df.iterrows():
+        reasons = row.get("All_Hold_Reasons_List", [])
+        tat = row.get("TAT_Days")
+        if not isinstance(reasons, list) or pd.isna(tat):
+            continue
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if not reason_text:
+                continue
+            if reason_text.lower() in REASON_SKIP_TOKENS:
+                continue
+            records.append({"Value": reason_text, "TAT_Days": float(tat)})
+
+    if not records:
+        st.info("No onHoldReasonDescription values found.")
+        return
+
+    grouped = (
+        pd.DataFrame(records)
+        .groupby("Value")
+        .agg(Number_of_Cases=("TAT_Days", "size"), Avg_TAT_Days=("TAT_Days", "mean"))
+        .reset_index()
+        .sort_values("Number_of_Cases", ascending=False)
+        .head(top_n)
+    )
+    st.dataframe(style_table_one_decimal(grouped, highlight_ge7_cols=["Avg_TAT_Days"]), use_container_width=True, hide_index=True)
+
+
+def top_counts_from_reason_list(df, top_n=15):
+    records = []
+    if "All_Hold_Reasons_List" not in df.columns:
+        return pd.DataFrame(columns=["Value", "Count"])
+
+    for _, row in df.iterrows():
+        reasons = row.get("All_Hold_Reasons_List", [])
+        if not isinstance(reasons, list):
+            continue
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if reason_text and reason_text.lower() not in REASON_SKIP_TOKENS:
+                records.append(reason_text)
+
+    if not records:
+        return pd.DataFrame(columns=["Value", "Count"])
+
+    series = pd.Series(records, dtype="object")
+    counts = series.value_counts().head(top_n).reset_index()
+    counts.columns = ["Value", "Count"]
+    return counts
 
 
 def build_hold_reason_impact(df):
@@ -790,10 +897,10 @@ def render_tab_one(filtered_df):
                 top_cols[1].metric("Max TAT", f"{high_tat['TAT_Days'].max():.1f} days")
                 top_cols[2].metric("Average TAT for 7+ TAT", f"{high_tat['TAT_Days'].mean():.1f} days")
 
-                build_top_table_with_tat(
+                build_top_hold_reason_with_tat(
                     high_tat,
-                    ["onHoldReasonDescription", "PrimaryHoldReason"],
                     "Top 5 onHoldReasonDescription",
+                    top_n=5,
                 )
                 build_top_table_with_tat(
                     high_tat,
@@ -896,7 +1003,9 @@ def render_tab_two(filtered_df, completed_df):
     with reason_col1:
         with st.container(border=True):
             st.subheader("On-Hold Cases: Hold Reason Distribution")
-            top_reasons = top_counts(on_hold_cases, reason_col, top_n=15)
+            top_reasons = top_counts_from_reason_list(on_hold_cases, top_n=15)
+            if top_reasons.empty:
+                top_reasons = top_counts(on_hold_cases, reason_col, top_n=15)
             if top_reasons.empty:
                 st.info("Hold reason column is unavailable.")
             else:

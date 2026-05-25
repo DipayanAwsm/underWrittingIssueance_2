@@ -1,0 +1,84 @@
+{
+  "generated_at": "2026-05-21T19:34:27",
+  "output_dir": "/Users/rituparnapaldas/Documents/Exl_POC/underWrittingIssueance_2/underWrittingIssueance_2/output1",
+  "tables": [
+    {
+      "name": "fact_cases",
+      "file": "fact_cases.csv",
+      "rows": 10000,
+      "columns": 182
+    },
+    {
+      "name": "fact_hold_events",
+      "file": "fact_hold_events.csv",
+      "rows": 4842,
+      "columns": 9
+    },
+    {
+      "name": "agg_monthly_tat_bucket",
+      "file": "agg_monthly_tat_bucket.csv",
+      "rows": 37,
+      "columns": 3
+    },
+    {
+      "name": "agg_monthly_holds_by_tat_bucket",
+      "file": "agg_monthly_holds_by_tat_bucket.csv",
+      "rows": 37,
+      "columns": 4
+    },
+    {
+      "name": "agg_hold_reason_impact",
+      "file": "agg_hold_reason_impact.csv",
+      "rows": 6,
+      "columns": 4
+    },
+    {
+      "name": "agg_top_brokers",
+      "file": "agg_top_brokers.csv",
+      "rows": 10,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_account_analyst_7plus",
+      "file": "agg_top_account_analyst_7plus.csv",
+      "rows": 10,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_underwriter_7plus",
+      "file": "agg_top_underwriter_7plus.csv",
+      "rows": 10,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_rater_7plus",
+      "file": "agg_top_rater_7plus.csv",
+      "rows": 10,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_7plus_onholdreason",
+      "file": "agg_top_7plus_onholdreason.csv",
+      "rows": 5,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_7plus_bgi",
+      "file": "agg_top_7plus_bgi.csv",
+      "rows": 4,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_7plus_lob",
+      "file": "agg_top_7plus_lob.csv",
+      "rows": 3,
+      "columns": 3
+    },
+    {
+      "name": "agg_top_7plus_state",
+      "file": "agg_top_7plus_state.csv",
+      "rows": 5,
+      "columns": 3
+    }
+  ]
+}

@@ -8,12 +8,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import warnings
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+MISSING_TOKENS = {"", "nan", "none", "null", "na", "n/a", "-", "[]"}
+DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
+REASON_SKIP_TOKENS = {"unknown", "unspecified"}
 
 
 def load_data(input_path: str | Path) -> pd.DataFrame:
@@ -25,24 +30,53 @@ def load_data(input_path: str | Path) -> pd.DataFrame:
     raise ValueError(f"Unsupported input format: {input_path}")
 
 
-def parse_separated_values(value) -> list[str]:
-    if pd.isna(value):
-        return []
+def clean_text(value: object) -> str:
+    if value is None or pd.isna(value):
+        return ""
+    text = str(value).strip().strip("[]")
+    if not text or text.lower() in MISSING_TOKENS:
+        return ""
+    return text
 
-    text = str(value).strip()
+
+def clean_tokens(tokens: list[str]) -> list[str]:
+    out: list[str] = []
+    for token in tokens:
+        item = str(token).strip()
+        if not item or item.lower() in MISSING_TOKENS:
+            continue
+        out.append(item)
+    return out
+
+
+def parse_date_history_cell(value: object) -> list[str]:
+    text = clean_text(value)
     if not text:
         return []
-
     if "|" in text:
-        parts = text.split("|")
-    elif ", " in text:
-        parts = text.split(", ")
-    elif "," in text:
-        parts = text.split(",")
-    else:
-        return [text]
+        return clean_tokens(text.split("|"))
+    if "," in text:
+        matches = DATE_TOKEN_PATTERN.findall(text)
+        if matches:
+            return clean_tokens(matches)
+        return clean_tokens(re.split(r"\s*,\s*", text))
+    return clean_tokens([text])
 
-    return [p.strip() for p in parts if str(p).strip()]
+
+def parse_reason_history_cell(value: object, expected_count: int | None = None) -> list[str]:
+    text = clean_text(value)
+    if not text:
+        return []
+    if "|" in text:
+        return clean_tokens(text.split("|"))
+    if "," in text:
+        if expected_count is not None and expected_count <= 1:
+            return clean_tokens([text])
+        parts = clean_tokens(re.split(r"\s*,\s*", text))
+        if expected_count is not None and expected_count > 1 and len(parts) != expected_count:
+            return clean_tokens([text])
+        return parts
+    return clean_tokens([text])
 
 
 def resolve_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
@@ -102,7 +136,6 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     create_col = resolve_column(data, ["createDateTime"])
     complete_col = resolve_column(data, ["completedDateTime"])
-    tat_col = resolve_column(data, ["TAT", "Tat", "tat"])
     holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
     history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
     hold_reason_col = resolve_column(data, ["onHoldReasonDescription"])
@@ -120,18 +153,28 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         data["completedDateTime"] = pd.NaT
 
     tat_from_dates = (data["completedDateTime"] - data["createDateTime"]).dt.total_seconds() / 86400.0
-
-    if tat_col:
-        fallback_tat = to_float_series(data[tat_col])
-        data["TAT_Days"] = tat_from_dates.where(tat_from_dates.notna(), fallback_tat)
-    else:
-        data["TAT_Days"] = tat_from_dates
+    data["TAT_Days"] = tat_from_dates
 
     data.loc[data["TAT_Days"] < 0, "TAT_Days"] = np.nan
 
     hold_counts = pd.Series(0, index=data.index, dtype="float64")
     if history_reason_col:
-        hold_counts = data[history_reason_col].apply(lambda v: len(parse_separated_values(v))).astype("float64")
+        if on_hold_dates_col:
+            hold_counts = data.apply(
+                lambda row: len(
+                    parse_reason_history_cell(
+                        row.get(history_reason_col, ""),
+                        expected_count=(
+                            lambda on_vals: len(on_vals) if on_vals else None
+                        )(parse_date_history_cell(row.get(on_hold_dates_col, ""))),
+                    )
+                ),
+                axis=1,
+            ).astype("float64")
+        else:
+            hold_counts = data[history_reason_col].apply(
+                lambda v: len(parse_reason_history_cell(v, expected_count=None))
+            ).astype("float64")
 
     if holds_col:
         numeric_holds = to_float_series(data[holds_col])
@@ -146,18 +189,23 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
 
     hold_reasons_list = []
+    all_hold_reasons_list = []
     hold_days_list = []
     now_ts = pd.Timestamp.now()
 
     for _, row in data.iterrows():
-        reasons = parse_separated_values(row.get(history_reason_col, "")) if history_reason_col else []
-        if not reasons and hold_reason_col:
-            primary_reason = row.get(hold_reason_col, "")
-            if pd.notna(primary_reason) and str(primary_reason).strip():
-                reasons = [str(primary_reason).strip()]
+        history_text = row.get(history_reason_col, "") if history_reason_col else ""
+        on_hold_raw = parse_date_history_cell(row.get(on_hold_dates_col, "")) if on_hold_dates_col else []
+        off_hold_raw = parse_date_history_cell(row.get(off_hold_dates_col, "")) if off_hold_dates_col else []
+        reasons = parse_reason_history_cell(history_text, expected_count=len(on_hold_raw) if on_hold_raw else None)
 
-        on_hold_raw = parse_separated_values(row.get(on_hold_dates_col, "")) if on_hold_dates_col else []
-        off_hold_raw = parse_separated_values(row.get(off_hold_dates_col, "")) if off_hold_dates_col else []
+        reasons_for_top = parse_reason_history_cell(history_text, expected_count=None)
+        if not reasons_for_top and hold_reason_col:
+            reasons_for_top = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
+        all_hold_reasons_list.append(reasons_for_top)
+
+        if not reasons and hold_reason_col:
+            reasons = parse_reason_history_cell(row.get(hold_reason_col, ""), expected_count=1)
 
         on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
         on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
@@ -193,6 +241,7 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         hold_days_list.append(aligned_days)
 
     data["Hold_Reasons_List"] = hold_reasons_list
+    data["All_Hold_Reasons_List"] = all_hold_reasons_list
     data["Hold_Days_List"] = hold_days_list
     data["Total_Hold_Days"] = data["Hold_Days_List"].apply(lambda v: float(np.sum(v)) if v else 0.0)
 
@@ -200,14 +249,7 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     data["Month_Str"] = data["Month"].astype(str)
     data.loc[data["createDateTime"].isna(), "Month_Str"] = np.nan
 
-    if hold_reason_col:
-        data["PrimaryHoldReason"] = data[hold_reason_col].fillna("Unknown").astype(str)
-    elif history_reason_col:
-        data["PrimaryHoldReason"] = data[history_reason_col].apply(
-            lambda v: parse_separated_values(v)[0] if parse_separated_values(v) else "Unknown"
-        )
-    else:
-        data["PrimaryHoldReason"] = "Unknown"
+    data["PrimaryHoldReason"] = data["All_Hold_Reasons_List"].apply(lambda v: v[0] if isinstance(v, list) and v else "Unknown")
 
     return data
 
@@ -248,11 +290,43 @@ def build_hold_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def build_reason_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
+    request_col = resolve_column(prepared_df, ["requestId"])
+    process_col = resolve_column(prepared_df, ["processId"])
+
+    records = []
+    for idx, row in prepared_df.iterrows():
+        reasons = row.get("All_Hold_Reasons_List", [])
+        if not isinstance(reasons, list) or not reasons:
+            continue
+
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if not reason_text:
+                continue
+            if reason_text.lower() in REASON_SKIP_TOKENS:
+                continue
+            records.append(
+                {
+                    "row_index": int(idx),
+                    "requestId": row.get(request_col) if request_col else None,
+                    "processId": row.get(process_col) if process_col else None,
+                    "Month_Str": row.get("Month_Str"),
+                    "TAT_Days": row.get("TAT_Days"),
+                    "TAT_Bucket": row.get("TAT_Bucket"),
+                    "onHoldReasonDescription": reason_text,
+                }
+            )
+
+    return pd.DataFrame(records)
+
+
 def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
     high_tat_df = completed_df[completed_df["TAT_Bucket"] == "7+ days"].copy()
 
     hold_events_df = build_hold_events(prepared_df)
+    reason_events_df = build_reason_events(prepared_df)
 
     monthly_tat_bucket = (
         completed_df.dropna(subset=["Month_Str", "TAT_Bucket"])
@@ -298,7 +372,24 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     top_underwriter_7plus = top_with_avg_tat(high_tat_df, ["underwriterName", "underwriter"], top_n=10)
     top_rater_7plus = top_with_avg_tat(high_tat_df, ["raterFullName"], top_n=10)
 
-    top_7plus_hold_reason = top_with_avg_tat(high_tat_df, ["onHoldReasonDescription", "PrimaryHoldReason"], top_n=5)
+    top_7plus_hold_reason = pd.DataFrame(columns=["Value", "Number_of_Cases", "Avg_TAT_Days"])
+    if not reason_events_df.empty:
+        reason_7plus = reason_events_df[reason_events_df["TAT_Bucket"] == "7+ days"].copy()
+        if not reason_7plus.empty:
+            top_7plus_hold_reason = (
+                reason_7plus.assign(
+                    Value=reason_7plus["onHoldReasonDescription"]
+                    .fillna("Unknown")
+                    .astype(str)
+                    .str.strip()
+                    .replace("", "Unknown")
+                )
+                .groupby("Value")
+                .agg(Number_of_Cases=("TAT_Days", "size"), Avg_TAT_Days=("TAT_Days", "mean"))
+                .reset_index()
+                .sort_values("Number_of_Cases", ascending=False)
+                .head(5)
+            )
     top_7plus_bgi = top_with_avg_tat(high_tat_df, ["bgiDescription"], top_n=5)
     top_7plus_lob = top_with_avg_tat(high_tat_df, ["lineOfBusinessDescription"], top_n=5)
     top_7plus_state = top_with_avg_tat(high_tat_df, ["AgentBrokerStateCode"], top_n=5)
@@ -306,6 +397,7 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     tables = {
         "fact_cases": prepared_df,
         "fact_hold_events": hold_events_df,
+        "fact_reason_events": reason_events_df,
         "agg_monthly_tat_bucket": monthly_tat_bucket,
         "agg_monthly_holds_by_tat_bucket": monthly_holds_by_tat_bucket,
         "agg_hold_reason_impact": hold_reason_impact,
@@ -329,7 +421,7 @@ def write_outputs(tables: dict[str, pd.DataFrame], output_dir: Path) -> dict:
         out_df = df.copy()
 
         # Serialize list columns to pipe-delimited strings for cross-tool compatibility.
-        for list_col in ["Hold_Reasons_List", "Hold_Days_List"]:
+        for list_col in ["Hold_Reasons_List", "All_Hold_Reasons_List", "Hold_Days_List"]:
             if list_col in out_df.columns:
                 out_df[list_col] = out_df[list_col].apply(
                     lambda v: "|".join(map(str, v)) if isinstance(v, list) else v
