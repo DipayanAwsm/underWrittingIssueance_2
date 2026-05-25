@@ -638,6 +638,45 @@ def build_hold_reason_impact(df):
     return impact_df
 
 
+def linear_sensitivity(x_series, y_series, min_samples=3):
+    model_df = pd.DataFrame({"x": x_series, "y": y_series}).replace([np.inf, -np.inf], np.nan).dropna()
+    if len(model_df) < min_samples or model_df["x"].nunique() < 2:
+        return np.nan, np.nan, int(len(model_df))
+
+    slope, _ = np.polyfit(model_df["x"], model_df["y"], 1)
+    corr = model_df["x"].corr(model_df["y"])
+    r2 = float(corr ** 2) if pd.notna(corr) else np.nan
+    return float(slope), r2, int(len(model_df))
+
+
+def build_monthly_shock_frame(filtered_df, completed_df):
+    if completed_df.empty:
+        return pd.DataFrame()
+
+    monthly_completed = (
+        completed_df.dropna(subset=["Month_Str"])
+        .groupby("Month_Str")
+        .agg(
+            Mean_TAT_Days=("TAT_Days", "mean"),
+            Avg_Touches=("Hold_Count", "mean"),
+            Avg_Hold_Days_Per_Case=("Total_Hold_Days", "mean"),
+            Hold_Case_Rate=("Hold_Count", lambda s: float((s > 0).mean() * 100.0)),
+            SevenPlus_Rate=("TAT_Bucket", lambda s: float((s == "7+ days").mean() * 100.0)),
+        )
+        .reset_index()
+    )
+
+    monthly_all = (
+        filtered_df.dropna(subset=["Month_Str"])
+        .groupby("Month_Str")
+        .agg(Open_Case_Rate=("completedDateTime", lambda s: float(s.isna().mean() * 100.0)))
+        .reset_index()
+    )
+
+    monthly = monthly_completed.merge(monthly_all, on="Month_Str", how="left")
+    return monthly.sort_values("Month_Str")
+
+
 def suggest_action_for_reason(reason):
     text = str(reason).lower()
 
@@ -1099,6 +1138,146 @@ def render_tab_two(filtered_df, completed_df):
         st.dataframe(style_table_one_decimal(reason_summary), use_container_width=True, hide_index=True)
 
 
+def render_tab_three(filtered_df, completed_df):
+    st.subheader("Shock Simulator")
+
+    if completed_df.empty:
+        st.info("No completed cases available for TAT simulation.")
+        return
+
+    baseline_tat = float(completed_df["TAT_Days"].mean()) if completed_df["TAT_Days"].notna().any() else np.nan
+    if pd.isna(baseline_tat):
+        st.info("Baseline TAT is unavailable for current filter selection.")
+        return
+
+    monthly_shock = build_monthly_shock_frame(filtered_df, completed_df)
+
+    kpi_specs = [
+        {"label": "Avg Touches", "col": "Avg_Touches", "unit": ""},
+        {"label": "Avg Hold Days per Case", "col": "Avg_Hold_Days_Per_Case", "unit": "days"},
+        {"label": "Hold Case Rate", "col": "Hold_Case_Rate", "unit": "%"},
+        {"label": "7+ Days Case Rate", "col": "SevenPlus_Rate", "unit": "%"},
+        {"label": "Open Case Rate", "col": "Open_Case_Rate", "unit": "%"},
+    ]
+
+    baseline_values = {
+        "Avg_Touches": float(filtered_df["Hold_Count"].mean()) if "Hold_Count" in filtered_df.columns else np.nan,
+        "Avg_Hold_Days_Per_Case": float(filtered_df["Total_Hold_Days"].mean()) if "Total_Hold_Days" in filtered_df.columns else np.nan,
+        "Hold_Case_Rate": float((filtered_df["Hold_Count"] > 0).mean() * 100.0) if "Hold_Count" in filtered_df.columns else np.nan,
+        "SevenPlus_Rate": float((completed_df["TAT_Bucket"] == "7+ days").mean() * 100.0) if "TAT_Bucket" in completed_df.columns else np.nan,
+        "Open_Case_Rate": float(filtered_df["completedDateTime"].isna().mean() * 100.0) if "completedDateTime" in filtered_df.columns else np.nan,
+    }
+
+    case_level_map = {
+        "Avg_Touches": "Hold_Count",
+        "Avg_Hold_Days_Per_Case": "Total_Hold_Days",
+    }
+
+    sensitivity_rows = []
+    for spec in kpi_specs:
+        kpi_col = spec["col"]
+        slope = np.nan
+        r2 = np.nan
+        samples = 0
+        model_type = "No model fit"
+
+        if not monthly_shock.empty and kpi_col in monthly_shock.columns:
+            slope, r2, samples = linear_sensitivity(monthly_shock[kpi_col], monthly_shock["Mean_TAT_Days"], min_samples=3)
+            if pd.notna(slope):
+                model_type = "Monthly sensitivity"
+
+        if pd.isna(slope) and kpi_col in case_level_map:
+            case_col = case_level_map[kpi_col]
+            if case_col in completed_df.columns:
+                slope, r2, samples = linear_sensitivity(completed_df[case_col], completed_df["TAT_Days"], min_samples=25)
+                if pd.notna(slope):
+                    model_type = "Case-level fallback"
+
+        sensitivity_rows.append(
+            {
+                "KPI": spec["label"],
+                "KPI_Column": kpi_col,
+                "Baseline_Value": baseline_values.get(kpi_col, np.nan),
+                "Sensitivity_Days_per_Unit": slope,
+                "Model_R2": r2,
+                "Samples_Used": samples,
+                "Model_Type": model_type,
+                "Unit": spec["unit"],
+            }
+        )
+
+    sensitivity_df = pd.DataFrame(sensitivity_rows)
+    if sensitivity_df.empty:
+        st.info("No KPI sensitivity data available.")
+        return
+
+    left_col, right_col = st.columns([1, 2])
+    with left_col:
+        with st.container(border=True):
+            st.markdown("### Scenario Input")
+            selected_kpi = st.selectbox("KPI Driver", options=sensitivity_df["KPI"].tolist(), index=0)
+            shock_pct = st.slider("Change in KPI (%)", min_value=-50, max_value=50, value=10, step=1)
+            st.caption("Positive % means KPI increase. Negative % means KPI decrease.")
+
+    selected_row = sensitivity_df[sensitivity_df["KPI"] == selected_kpi].iloc[0]
+    base_kpi = selected_row["Baseline_Value"]
+    scenario_kpi = base_kpi * (1.0 + shock_pct / 100.0) if pd.notna(base_kpi) else np.nan
+    delta_kpi = scenario_kpi - base_kpi if pd.notna(base_kpi) and pd.notna(scenario_kpi) else np.nan
+
+    slope = selected_row["Sensitivity_Days_per_Unit"]
+    tat_impact = slope * delta_kpi if pd.notna(slope) and pd.notna(delta_kpi) else np.nan
+    simulated_tat = max(0.0, baseline_tat + tat_impact) if pd.notna(tat_impact) else np.nan
+
+    with right_col:
+        with st.container(border=True):
+            st.markdown("### Estimated TAT Impact")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Baseline Mean TAT", f"{baseline_tat:.1f} days")
+            m2.metric(
+                "Simulated Mean TAT",
+                f"{simulated_tat:.1f} days" if pd.notna(simulated_tat) else "N/A",
+            )
+            m3.metric(
+                "Estimated Impact",
+                f"{tat_impact:+.1f} days" if pd.notna(tat_impact) else "N/A",
+            )
+            m4.metric(
+                "Model Strength (R²)",
+                f"{selected_row['Model_R2']:.2f}" if pd.notna(selected_row["Model_R2"]) else "N/A",
+            )
+
+            scenario_df = pd.DataFrame(
+                {
+                    "Scenario": ["Baseline", "Simulated"],
+                    "Mean_TAT_Days": [baseline_tat, simulated_tat if pd.notna(simulated_tat) else baseline_tat],
+                }
+            )
+            fig_scenario = px.bar(
+                scenario_df,
+                x="Scenario",
+                y="Mean_TAT_Days",
+                color="Scenario",
+                title="TAT Before vs After Shock",
+                text="Mean_TAT_Days",
+                color_discrete_map={"Baseline": "#1976D2", "Simulated": "#EF6C00"},
+            )
+            fig_scenario.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+            fig_scenario.add_hline(y=7, line_dash="dash", line_color="#D32F2F", annotation_text="7-day mark")
+            st.plotly_chart(fig_scenario, use_container_width=True)
+
+            unit = selected_row["Unit"]
+            unit_suffix = unit if unit else "units"
+            st.caption(
+                f"{selected_kpi}: {base_kpi:.1f} -> {scenario_kpi:.1f} {unit_suffix} at {shock_pct:+.1f}% shock "
+                f"| Model: {selected_row['Model_Type']} | Samples: {int(selected_row['Samples_Used'])}"
+            )
+
+    st.markdown("#### KPI Sensitivity Reference")
+    ref_cols = ["KPI", "Baseline_Value", "Sensitivity_Days_per_Unit", "Model_R2", "Samples_Used", "Model_Type"]
+    st.dataframe(style_table_one_decimal(sensitivity_df[ref_cols]), use_container_width=True, hide_index=True)
+    st.caption("Sensitivity is estimated from current filtered data. Use this as directional what-if analysis, not a causal guarantee.")
+
+
 def main():
     st.markdown('<div class="main-title">Underwriting Issuance - Intelligent View</div>', unsafe_allow_html=True)
     st.markdown(
@@ -1168,13 +1347,18 @@ def main():
         mime="text/csv",
     )
 
-    tab1, tab2 = st.tabs(["Tab 1 - TAT Overview", "Tab 2 - Hold Intelligence"])
+    tab1, tab2, tab3 = st.tabs(
+        ["Tab 1 - TAT Overview", "Tab 2 - Hold Intelligence", "Tab 3 - Shock Simulator"]
+    )
 
     with tab1:
         render_tab_one(filtered_df)
 
     with tab2:
         render_tab_two(filtered_df, completed_df)
+
+    with tab3:
+        render_tab_three(filtered_df, completed_df)
 
 
 if __name__ == "__main__":
