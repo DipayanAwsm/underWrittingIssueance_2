@@ -1,0 +1,15 @@
+Reasons for Hold,Meaning,Next Steps for Customer,Next Steps for Underwriter,Next Steps for Ops Team,Next Steps for Customer Service
+Distribution Auto Hold,"System automatically puts policy on hold due to rules linked to agent/broker/channel (e.g., authorization, missing approvals). Broker is not mapped to that product or region → issuance blocked.",,,"Validate broker access, approvals, mappings",Coordinate with agent/broker and inform issue
+Booking Validation,"Initial policy booking details (premium, coverage, client data) need verification. Eg Quoted premium ≠ system premium due to wrong exposure value.",,Reconfirm terms if required,Validate and correct booking,Communicate corrections if impacting customer
+Underwriting Request,Policy is awaiting risk assessment/decision from underwriting. Large liability policy requires underwriter approval before issuance.,,Review risk and approve/revise,Manage queue/escalate delays,Provide status update
+Write-Out,Policy cannot be auto-issued; requires manual creation/issuance. Eg. Custom wording or special clauses require manual processing.,,,Execute manual issuance,Track progress and follow up
+Large Audit Variance,Significant mismatch found between declared vs verified exposure data. Eg. Declared payroll ₹2Cr but audit shows ₹3.5Cr → premium gap.,Provide revised data/clarification,Reprice or approve revised terms,Validate variance,Coordinate resolution
+System Issues,Technical/system error preventing policy processing. Eg. Policy stuck in issuance due to integration failure.,,,Fix defect,Communicate delay and track resolution
+Other,,,,,
+QA,"Policy under final quality checks before issuance. Eg. QA team validating premium, endorsements, and wording accuracy.",,,Complete validation,Monitor SLA and follow up
+Mid-term Endorsement,Policy changes requested before final issuance. Eg. Customer wants coverage increase after booking but before issuance.,Confirm requested change,Approve if risk changes,Update policy,Coordinate
+EPA - Validate Policy View,Policy data needs validation in EPA (Electronic Policy Administration system). Eg. Policy details not matching system-generated view.,,,Validate and reconcile system data,Track and escalate if delayed
+Canadian Transaction,Policy requires region-specific regulatory or system handling. Eg. Policy issued under Canada compliance framework.,,Ensure compliance,Validate regulatory requirements,Inform stakeholders if delay
+OCIP - Pending Master,Policy depends on master policy setup. Eg. Contractor policy cannot be issued until master OCIP program is finalized.,,Link dependent policies,Finalize master policy,Track dependency and communicate
+Temporary Entry,Placeholder record created; full details not yet entered. Eg. Policy logged quickly to meet deadline but missing information.,Provide missing info,,Complete record,Follow up
+Inventory Control,Issuance delayed due to system/document inventory or queue restrictions. Eg. Policy stuck due to document sequencing or system batch control.,,,Release/clear backlog,Monitor and escalate

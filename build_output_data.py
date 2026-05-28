@@ -11,6 +11,7 @@ import json
 import re
 import warnings
 from datetime import datetime
+from difflib import SequenceMatcher
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,13 @@ import pandas as pd
 MISSING_TOKENS = {"", "nan", "none", "null", "na", "n/a", "-", "[]"}
 DATE_TOKEN_PATTERN = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}")
 REASON_SKIP_TOKENS = {"unknown", "unspecified"}
+RECOMMENDATION_COLUMNS = [
+    "Reasons for Hold",
+    "Next Steps for Customer",
+    "Next Steps for Underwriter",
+    "Next Steps for Ops Team",
+    "Next Steps for Customer Service",
+]
 
 
 def load_data(input_path: str | Path) -> pd.DataFrame:
@@ -79,6 +87,123 @@ def parse_reason_history_cell(value: object, expected_count: int | None = None) 
     return clean_tokens([text])
 
 
+def normalize_reason_text(value: object) -> str:
+    text = clean_text(value).lower()
+    if not text:
+        return ""
+    text = re.sub(r"[^a-z0-9]+", " ", text).strip()
+    return re.sub(r"\s+", " ", text)
+
+
+def reason_tokens(text: str) -> set[str]:
+    stop = {"for", "and", "the", "to", "of", "in", "on", "a", "an"}
+    tokens = []
+    for tok in text.split():
+        t = tok.strip()
+        if not t or t in stop:
+            continue
+        if len(t) > 4 and t.endswith("s"):
+            t = t[:-1]
+        tokens.append(t)
+    return set(tokens)
+
+
+def best_recommendation_key(reason_norm: str, rec_norm_values: list[str]) -> str | None:
+    if not reason_norm or not rec_norm_values:
+        return None
+
+    # 1) Exact
+    if reason_norm in rec_norm_values:
+        return reason_norm
+
+    # 2) Contains
+    contains_candidates = [rn for rn in rec_norm_values if (reason_norm in rn) or (rn in reason_norm)]
+    if contains_candidates:
+        return max(contains_candidates, key=len)
+
+    # 3) Token overlap
+    rt = reason_tokens(reason_norm)
+    best_key = None
+    best_overlap = 0.0
+    for rn in rec_norm_values:
+        tt = reason_tokens(rn)
+        if not rt or not tt:
+            continue
+        overlap = len(rt & tt) / max(len(rt), 1)
+        if overlap > best_overlap:
+            best_overlap = overlap
+            best_key = rn
+    if best_key is not None and best_overlap > 0:
+        return best_key
+
+    # 4) Sequence similarity
+    scored = [(SequenceMatcher(None, reason_norm, rn).ratio(), rn) for rn in rec_norm_values]
+    scored.sort(reverse=True)
+    if scored and scored[0][0] >= 0.58:
+        return scored[0][1]
+    return None
+
+
+def load_recommendation_reference(path: Path | str = "recommendation.csv") -> pd.DataFrame:
+    rec_path = Path(path)
+    if not rec_path.exists():
+        return pd.DataFrame(columns=RECOMMENDATION_COLUMNS)
+
+    rec_df = pd.read_csv(rec_path)
+    missing_cols = [c for c in RECOMMENDATION_COLUMNS if c not in rec_df.columns]
+    for col in missing_cols:
+        rec_df[col] = np.nan
+
+    rec_df = rec_df[RECOMMENDATION_COLUMNS].copy()
+    rec_df["__reason_norm"] = rec_df["Reasons for Hold"].apply(normalize_reason_text)
+    rec_df = rec_df[rec_df["__reason_norm"].ne("")].drop_duplicates("__reason_norm", keep="first")
+    return rec_df
+
+
+def map_recommendations(reason_counts_df: pd.DataFrame, recommendation_df: pd.DataFrame) -> pd.DataFrame:
+    base_cols = [
+        "onHoldReasonDescriptionsHistory",
+        "Count",
+        "Reasons for Hold",
+        "Next Steps for Customer",
+        "Next Steps for Underwriter",
+        "Next Steps for Ops Team",
+        "Next Steps for Customer Service",
+    ]
+    if reason_counts_df.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    rec_by_norm = {}
+    rec_norm_values = []
+    if not recommendation_df.empty and "__reason_norm" in recommendation_df.columns:
+        rec_by_norm = {row["__reason_norm"]: row for _, row in recommendation_df.iterrows()}
+        rec_norm_values = list(rec_by_norm.keys())
+
+    out_rows = []
+    for _, row in reason_counts_df.iterrows():
+        reason_text = row["Value"]
+        reason_norm = normalize_reason_text(reason_text)
+        matched = None
+
+        best_key = best_recommendation_key(reason_norm, rec_norm_values)
+        if best_key is not None:
+            matched = rec_by_norm[best_key]
+
+        out_rows.append(
+            {
+                "onHoldReasonDescriptionsHistory": reason_text,
+                "Count": row["Count"],
+                "Reasons for Hold": matched["Reasons for Hold"] if matched is not None else np.nan,
+                "Next Steps for Customer": matched["Next Steps for Customer"] if matched is not None else np.nan,
+                "Next Steps for Underwriter": matched["Next Steps for Underwriter"] if matched is not None else np.nan,
+                "Next Steps for Ops Team": matched["Next Steps for Ops Team"] if matched is not None else np.nan,
+                "Next Steps for Customer Service": matched["Next Steps for Customer Service"] if matched is not None else np.nan,
+            }
+        )
+
+    return pd.DataFrame(out_rows, columns=base_cols)
+
+
 def resolve_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
     for col in candidates:
         if col in df.columns:
@@ -120,12 +245,20 @@ def parse_datetime_series(series: pd.Series) -> pd.Series:
 
 
 def parse_datetime_value(value):
-    if pd.isna(value):
+    text = clean_text(value)
+    if not text:
         return pd.NaT
+
+    # Parse strict ISO first to avoid day-first misreads (e.g., 2025-03-01).
+    if re.match(r"^\d{4}-\d{2}-\d{2}", text):
+        iso_dt = pd.to_datetime(text, errors="coerce", dayfirst=False)
+        if pd.notna(iso_dt):
+            return iso_dt
+
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        dt_dayfirst = pd.to_datetime(value, errors="coerce", dayfirst=True)
-        dt_default = pd.to_datetime(value, errors="coerce")
+        dt_dayfirst = pd.to_datetime(text, errors="coerce", dayfirst=True)
+        dt_default = pd.to_datetime(text, errors="coerce")
     if pd.notna(dt_dayfirst):
         return dt_dayfirst
     return dt_default
@@ -136,7 +269,6 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
     create_col = resolve_column(data, ["createDateTime"])
     complete_col = resolve_column(data, ["completedDateTime"])
-    holds_col = resolve_column(data, ["No of Holds", "No_of_Holds", "numberOfHolds"])
     history_reason_col = resolve_column(data, ["onHoldReasonDescriptionsHistory"])
     on_hold_dates_col = resolve_column(data, ["onHoldDatesHistory"])
     off_hold_dates_col = resolve_column(data, ["offHoldDatesHistory"])
@@ -155,38 +287,13 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     data["TAT_Days"] = tat_from_dates
 
     data.loc[data["TAT_Days"] < 0, "TAT_Days"] = np.nan
-
-    hold_counts = pd.Series(0, index=data.index, dtype="float64")
-    if history_reason_col:
-        if on_hold_dates_col:
-            hold_counts = data.apply(
-                lambda row: len(
-                    parse_reason_history_cell(
-                        row.get(history_reason_col, ""),
-                        expected_count=(
-                            lambda on_vals: len(on_vals) if on_vals else None
-                        )(parse_date_history_cell(row.get(on_hold_dates_col, ""))),
-                    )
-                ),
-                axis=1,
-            ).astype("float64")
-        else:
-            hold_counts = data[history_reason_col].apply(
-                lambda v: len(parse_reason_history_cell(v, expected_count=None))
-            ).astype("float64")
-
-    if holds_col:
-        numeric_holds = to_float_series(data[holds_col])
-        hold_counts = hold_counts.where(hold_counts > 0, numeric_holds)
-
-    data["Hold_Count"] = hold_counts.fillna(0).clip(lower=0)
-    data["CaseType"] = data["Hold_Count"].apply(infer_case_type)
     data["TAT_Bucket"] = data["TAT_Days"].apply(create_tat_bucket)
 
     hold_reasons_list = []
     all_hold_reasons_list = []
     hold_days_list = []
-    now_ts = pd.Timestamp.now()
+    hold_counts_list = []
+    global_last_completed_dt = data["completedDateTime"].dropna().max()
 
     for _, row in data.iterrows():
         history_text = row.get(history_reason_col, "") if history_reason_col else ""
@@ -198,13 +305,11 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
         all_hold_reasons_list.append(reasons_for_top)
 
         on_hold_dates = [parse_datetime_value(v) for v in on_hold_raw]
-        on_hold_dates = [d for d in on_hold_dates if pd.notna(d)]
         off_hold_dates = [parse_datetime_value(v) for v in off_hold_raw]
-        off_hold_dates = [d for d in off_hold_dates if pd.notna(d)]
 
         aligned_reasons = []
         aligned_days = []
-        event_count = max(len(reasons), len(on_hold_dates))
+        event_count = max(len(on_hold_dates), len(reasons))
 
         for idx in range(event_count):
             on_dt = on_hold_dates[idx] if idx < len(on_hold_dates) else pd.NaT
@@ -217,10 +322,10 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
             off_dt = off_hold_dates[idx] if idx < len(off_hold_dates) else pd.NaT
             if pd.notna(off_dt):
                 end_dt = off_dt
-            elif pd.notna(row.get("completedDateTime")):
-                end_dt = row.get("completedDateTime")
+            elif pd.notna(global_last_completed_dt):
+                end_dt = global_last_completed_dt
             else:
-                end_dt = now_ts
+                continue
 
             days = (end_dt - on_dt).total_seconds() / 86400.0
             if pd.notna(days) and days >= 0:
@@ -229,11 +334,14 @@ def prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
 
         hold_reasons_list.append(aligned_reasons)
         hold_days_list.append(aligned_days)
+        hold_counts_list.append(float(len(aligned_days)) if aligned_days else 1.0)
 
     data["Hold_Reasons_List"] = hold_reasons_list
     data["All_Hold_Reasons_List"] = all_hold_reasons_list
     data["Hold_Days_List"] = hold_days_list
     data["Total_Hold_Days"] = data["Hold_Days_List"].apply(lambda v: float(np.sum(v)) if v else 0.0)
+    data["Hold_Count"] = pd.Series(hold_counts_list, index=data.index, dtype="float64").fillna(0).clip(lower=0)
+    data["CaseType"] = data["Hold_Count"].apply(infer_case_type)
 
     data["Month"] = data["createDateTime"].dt.to_period("M")
     data["Month_Str"] = data["Month"].astype(str)
@@ -314,9 +422,11 @@ def build_reason_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
 def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
     high_tat_df = completed_df[completed_df["TAT_Bucket"] == "7+ days"].copy()
+    on_hold_df = prepared_df[prepared_df["Hold_Count"] > 0].copy()
 
     hold_events_df = build_hold_events(prepared_df)
     reason_events_df = build_reason_events(prepared_df)
+    recommendation_df = load_recommendation_reference()
 
     monthly_tat_bucket = (
         completed_df.dropna(subset=["Month_Str", "TAT_Bucket"])
@@ -384,6 +494,24 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     top_7plus_lob = top_with_avg_tat(high_tat_df, ["lineOfBusinessDescription"], top_n=5)
     top_7plus_state = top_with_avg_tat(high_tat_df, ["AgentBrokerStateCode"], top_n=5)
 
+    top_hold_reason_counts = pd.DataFrame(columns=["Value", "Count"])
+    reason_tokens: list[str] = []
+    for _, row in on_hold_df.iterrows():
+        reasons = row.get("All_Hold_Reasons_List", [])
+        if not isinstance(reasons, list):
+            continue
+        for reason in reasons:
+            reason_text = str(reason).strip()
+            if reason_text and reason_text.lower() not in REASON_SKIP_TOKENS:
+                reason_tokens.append(reason_text)
+
+    if reason_tokens:
+        reason_series = pd.Series(reason_tokens, dtype="object")
+        top_hold_reason_counts = reason_series.value_counts().head(10).reset_index()
+        top_hold_reason_counts.columns = ["Value", "Count"]
+
+    prescriptive_actions = map_recommendations(top_hold_reason_counts, recommendation_df)
+
     tables = {
         "fact_cases": prepared_df,
         "fact_hold_events": hold_events_df,
@@ -399,6 +527,7 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "agg_top_7plus_bgi": top_7plus_bgi,
         "agg_top_7plus_lob": top_7plus_lob,
         "agg_top_7plus_state": top_7plus_state,
+        "agg_prescriptive_actions_top_hold_reasons": prescriptive_actions,
     }
     return tables
 
