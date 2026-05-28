@@ -1,0 +1,47 @@
+Shock Simulator Design (Reason-Wise Model)
+==========================================
+
+Purpose
+- Estimate how reducing hold reason delays impacts Average TAT.
+- Core formula:
+  TAT = Base Time + holdReason[1] + holdReason[2] + ... + holdReason[i]
+
+Model Inputs
+- requestId/processId
+- TAT_Days (completed cases)
+- Hold_Reasons_List
+- Hold_Days_List
+
+Reason-Wise Decomposition
+1. For each completed case, aggregate hold delays by reason from Hold_Reasons_List + Hold_Days_List.
+2. Compute Total_Reason_Delay = sum(all reason delays for that case).
+3. Compute Base Time = TAT_Days - Total_Reason_Delay (lower bounded at 0).
+4. If Total_Reason_Delay > TAT_Days, scale reason delays proportionally to keep:
+   Base Time + sum(reason delays) = TAT_Days.
+
+Shock Logic (Efficiency Improvements)
+- For each reason i:
+  New_Reason_Delay[i] = Old_Reason_Delay[i] * (1 - Efficiency_Improvement_%[i])
+- Projected TAT per case:
+  Projected_TAT = Base_Time + sum(New_Reason_Delay[i])
+
+Portfolio Outputs
+- Baseline Avg TAT = average(Baseline_TAT)
+- Projected Avg TAT = average(Projected_TAT)
+- Days Saved = Baseline Avg TAT - Projected Avg TAT
+- % Reduction = Days Saved / Baseline Avg TAT
+
+Reason-Level Outputs
+- holdReason[i]
+- Event Count
+- Avg Hold Time
+- Total Hold Time
+- Efficiency Improvement %
+- Projected Total Hold Time
+- Total Hold Time Saved
+
+Business Questions Answered
+- Which hold reason contributes most to total delay?
+- How much TAT can be reduced by improving a specific hold reason?
+- Which combination of reason efficiencies gives highest TAT reduction?
+

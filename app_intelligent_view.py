@@ -21,6 +21,8 @@ RECOMMENDATION_COLUMNS = [
     "Next Steps for Customer Service",
 ]
 
+REASON_COL_PREFIX = "REASON::"
+
 
 st.set_page_config(
     page_title="Underwriting Issuance - Intelligent View",
@@ -743,43 +745,109 @@ def build_hold_reason_impact(df):
     return impact_df
 
 
-def linear_sensitivity(x_series, y_series, min_samples=3):
-    model_df = pd.DataFrame({"x": x_series, "y": y_series}).replace([np.inf, -np.inf], np.nan).dropna()
-    if len(model_df) < min_samples or model_df["x"].nunique() < 2:
-        return np.nan, np.nan, int(len(model_df))
-
-    slope, _ = np.polyfit(model_df["x"], model_df["y"], 1)
-    corr = model_df["x"].corr(model_df["y"])
-    r2 = float(corr ** 2) if pd.notna(corr) else np.nan
-    return float(slope), r2, int(len(model_df))
-
-
-def build_monthly_shock_frame(filtered_df, completed_df):
+def build_reason_tat_model_frames(completed_df):
     if completed_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), pd.DataFrame()
 
-    monthly_completed = (
-        completed_df.dropna(subset=["Month_Str"])
-        .groupby("Month_Str")
-        .agg(
-            Mean_TAT_Days=("TAT_Days", "mean"),
-            Avg_Touches=("Hold_Count", "mean"),
-            Avg_Hold_Days_Per_Case=("Total_Hold_Days", "mean"),
-            Hold_Case_Rate=("Hold_Count", lambda s: float((s > 0).mean() * 100.0)),
-            SevenPlus_Rate=("TAT_Bucket", lambda s: float((s == "7+ days").mean() * 100.0)),
+    claim_id_col = resolve_column(completed_df, ["requestId", "processId"])
+    claim_rows = []
+    event_rows = []
+
+    for row_idx, row in completed_df.iterrows():
+        tat = row.get("TAT_Days")
+        if pd.isna(tat):
+            continue
+        tat = float(tat)
+
+        reasons = row.get("Hold_Reasons_List", [])
+        days_list = row.get("Hold_Days_List", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        if not isinstance(days_list, list):
+            days_list = []
+
+        reason_totals = {}
+        for i, day_val in enumerate(days_list):
+            if pd.isna(day_val):
+                continue
+            d = float(day_val)
+            if d < 0:
+                continue
+            reason = reasons[i] if i < len(reasons) else "Unknown"
+            reason = str(reason).strip() if str(reason).strip() else "Unknown"
+            reason_totals[reason] = reason_totals.get(reason, 0.0) + d
+            event_rows.append(
+                {
+                    "row_index": int(row_idx),
+                    "Reason": reason,
+                    "Hold_Days": d,
+                    "TAT_Days": tat,
+                }
+            )
+
+        total_reason_delay = float(sum(reason_totals.values()))
+        scale = 1.0
+        if total_reason_delay > tat and total_reason_delay > 0:
+            scale = tat / total_reason_delay
+
+        reason_totals_scaled = {r: d * scale for r, d in reason_totals.items()}
+        modeled_delay = float(sum(reason_totals_scaled.values()))
+        base_time = max(tat - modeled_delay, 0.0)
+
+        claim_row = {
+            "row_index": int(row_idx),
+            "Claim_ID": row.get(claim_id_col) if claim_id_col else f"row_{row_idx}",
+            "Baseline_TAT": tat,
+            "Base_Time": base_time,
+        }
+        for reason, delay_val in reason_totals_scaled.items():
+            claim_row[f"{REASON_COL_PREFIX}{reason}"] = float(delay_val)
+        claim_rows.append(claim_row)
+
+    claim_model_df = pd.DataFrame(claim_rows)
+    if claim_model_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    reason_cols = [c for c in claim_model_df.columns if c.startswith(REASON_COL_PREFIX)]
+    for c in reason_cols:
+        claim_model_df[c] = pd.to_numeric(claim_model_df[c], errors="coerce").fillna(0.0)
+
+    event_df = pd.DataFrame(event_rows)
+    if event_df.empty:
+        reason_summary = pd.DataFrame(columns=["Reason", "Event_Count", "Avg_Hold_Time", "Total_Hold_Time"])
+    else:
+        reason_summary = (
+            event_df.groupby("Reason")
+            .agg(
+                Event_Count=("Hold_Days", "size"),
+                Avg_Hold_Time=("Hold_Days", "mean"),
+                Total_Hold_Time=("Hold_Days", "sum"),
+            )
+            .reset_index()
+            .sort_values("Total_Hold_Time", ascending=False)
         )
-        .reset_index()
-    )
 
-    monthly_all = (
-        filtered_df.dropna(subset=["Month_Str"])
-        .groupby("Month_Str")
-        .agg(Open_Case_Rate=("completedDateTime", lambda s: float(s.isna().mean() * 100.0)))
-        .reset_index()
-    )
+    return claim_model_df, reason_summary
 
-    monthly = monthly_completed.merge(monthly_all, on="Month_Str", how="left")
-    return monthly.sort_values("Month_Str")
+
+def apply_reason_efficiency_shock(claim_model_df, reduction_map):
+    if claim_model_df.empty:
+        return claim_model_df.copy()
+
+    out = claim_model_df.copy()
+    reason_cols = [c for c in out.columns if c.startswith(REASON_COL_PREFIX)]
+    adjusted_cols = []
+    for c in reason_cols:
+        reason_name = c[len(REASON_COL_PREFIX):]
+        pct = float(reduction_map.get(reason_name, 0.0))
+        adj_col = f"ADJ::{reason_name}"
+        out[adj_col] = out[c] * (1 - pct / 100.0)
+        adjusted_cols.append(adj_col)
+
+    out["Projected_TAT"] = out["Base_Time"] + (out[adjusted_cols].sum(axis=1) if adjusted_cols else 0.0)
+    out["Days_Saved"] = out["Baseline_TAT"] - out["Projected_TAT"]
+    out["Pct_Reduction"] = np.where(out["Baseline_TAT"] > 0, out["Days_Saved"] / out["Baseline_TAT"] * 100.0, 0.0)
+    return out
 
 
 def suggest_action_for_reason(reason):
@@ -1248,141 +1316,145 @@ def render_tab_two(filtered_df, completed_df):
 def render_tab_three(filtered_df, completed_df):
     st.subheader("Shock Simulator")
 
-    if completed_df.empty:
-        st.info("No completed cases available for TAT simulation.")
+    if completed_df.empty or "TAT_Days" not in completed_df.columns:
+        st.info("No completed cases available for reason-wise shock simulation.")
         return
 
-    baseline_tat = float(completed_df["TAT_Days"].mean()) if completed_df["TAT_Days"].notna().any() else np.nan
-    if pd.isna(baseline_tat):
-        st.info("Baseline TAT is unavailable for current filter selection.")
+    claim_model_df, reason_summary_df = build_reason_tat_model_frames(completed_df)
+    if claim_model_df.empty:
+        st.info("No reason-wise hold delay components available for simulation.")
         return
 
-    monthly_shock = build_monthly_shock_frame(filtered_df, completed_df)
+    baseline_avg_tat = float(claim_model_df["Baseline_TAT"].mean())
 
-    kpi_specs = [
-        {"label": "Avg Touches", "col": "Avg_Touches", "unit": ""},
-        {"label": "Avg Hold Days per Case", "col": "Avg_Hold_Days_Per_Case", "unit": "days"},
-        {"label": "Hold Case Rate", "col": "Hold_Case_Rate", "unit": "%"},
-        {"label": "7+ Days Case Rate", "col": "SevenPlus_Rate", "unit": "%"},
-        {"label": "Open Case Rate", "col": "Open_Case_Rate", "unit": "%"},
-    ]
+    top_n = st.slider("Top hold reasons to tune", min_value=3, max_value=20, value=10, step=1)
+    reason_control_df = reason_summary_df.head(top_n).copy().reset_index(drop=True)
 
-    baseline_values = {
-        "Avg_Touches": float(filtered_df["Hold_Count"].mean()) if "Hold_Count" in filtered_df.columns else np.nan,
-        "Avg_Hold_Days_Per_Case": float(filtered_df["Total_Hold_Days"].mean()) if "Total_Hold_Days" in filtered_df.columns else np.nan,
-        "Hold_Case_Rate": float((filtered_df["Hold_Count"] > 0).mean() * 100.0) if "Hold_Count" in filtered_df.columns else np.nan,
-        "SevenPlus_Rate": float((completed_df["TAT_Bucket"] == "7+ days").mean() * 100.0) if "TAT_Bucket" in completed_df.columns else np.nan,
-        "Open_Case_Rate": float(filtered_df["completedDateTime"].isna().mean() * 100.0) if "completedDateTime" in filtered_df.columns else np.nan,
-    }
+    st.markdown("### Reason Efficiency Controls")
+    if "shock_reason_eff_map" not in st.session_state:
+        st.session_state["shock_reason_eff_map"] = {}
+    eff_map = st.session_state["shock_reason_eff_map"]
 
-    case_level_map = {
-        "Avg_Touches": "Hold_Count",
-        "Avg_Hold_Days_Per_Case": "Total_Hold_Days",
-    }
+    h1, h2, h3, h4 = st.columns([3.4, 1.0, 1.2, 1.4])
+    h1.caption("Reason")
+    h2.caption("Events")
+    h3.caption("Avg Hold")
+    h4.caption("Efficiency %")
 
-    sensitivity_rows = []
-    for spec in kpi_specs:
-        kpi_col = spec["col"]
-        slope = np.nan
-        r2 = np.nan
-        samples = 0
-        model_type = "No model fit"
+    control_rows = []
+    for idx, r in reason_control_df.iterrows():
+        reason = str(r["Reason"])
+        events = int(r["Event_Count"])
+        avg_hold = float(r["Avg_Hold_Time"])
+        total_hold = float(r["Total_Hold_Time"])
+        default_eff = float(eff_map.get(reason, 0.0))
 
-        if not monthly_shock.empty and kpi_col in monthly_shock.columns:
-            slope, r2, samples = linear_sensitivity(monthly_shock[kpi_col], monthly_shock["Mean_TAT_Days"], min_samples=3)
-            if pd.notna(slope):
-                model_type = "Monthly sensitivity"
+        c1, c2, c3, c4 = st.columns([3.4, 1.0, 1.2, 1.4])
+        c1.write(reason)
+        c2.write(f"{events}")
+        c3.write(f"{avg_hold:.1f}")
+        eff_val = c4.number_input(
+            f"Efficiency % - {reason}",
+            min_value=0.0,
+            max_value=95.0,
+            value=default_eff,
+            step=1.0,
+            key=f"shock_eff_{idx}_{normalize_reason_text(reason).replace(' ', '_')[:32]}",
+            label_visibility="collapsed",
+        )
+        eff_map[reason] = float(eff_val)
 
-        if pd.isna(slope) and kpi_col in case_level_map:
-            case_col = case_level_map[kpi_col]
-            if case_col in completed_df.columns:
-                slope, r2, samples = linear_sensitivity(completed_df[case_col], completed_df["TAT_Days"], min_samples=25)
-                if pd.notna(slope):
-                    model_type = "Case-level fallback"
-
-        sensitivity_rows.append(
+        control_rows.append(
             {
-                "KPI": spec["label"],
-                "KPI_Column": kpi_col,
-                "Baseline_Value": baseline_values.get(kpi_col, np.nan),
-                "Sensitivity_Days_per_Unit": slope,
-                "Model_R2": r2,
-                "Samples_Used": samples,
-                "Model_Type": model_type,
-                "Unit": spec["unit"],
+                "Reason": reason,
+                "Event_Count": events,
+                "Avg_Hold_Time": avg_hold,
+                "Total_Hold_Time": total_hold,
+                "Efficiency_Improvement_%": float(eff_val),
             }
         )
 
-    sensitivity_df = pd.DataFrame(sensitivity_rows)
-    if sensitivity_df.empty:
-        st.info("No KPI sensitivity data available.")
-        return
+    st.session_state["shock_reason_eff_map"] = eff_map
+    edited_controls = pd.DataFrame(control_rows)
+    reduction_map = {str(r["Reason"]): float(r["Efficiency_Improvement_%"]) for _, r in edited_controls.iterrows()}
 
-    left_col, right_col = st.columns([1, 2])
-    with left_col:
-        with st.container(border=True):
-            st.markdown("### Scenario Input")
-            selected_kpi = st.selectbox("KPI Driver", options=sensitivity_df["KPI"].tolist(), index=0)
-            shock_pct = st.slider("Change in KPI (%)", min_value=-50, max_value=50, value=10, step=1)
-            st.caption("Positive % means KPI increase. Negative % means KPI decrease.")
+    projected_df = apply_reason_efficiency_shock(claim_model_df, reduction_map)
+    projected_avg_tat = float(projected_df["Projected_TAT"].mean())
+    days_saved = baseline_avg_tat - projected_avg_tat
+    pct_reduction = (days_saved / baseline_avg_tat * 100.0) if baseline_avg_tat > 0 else 0.0
 
-    selected_row = sensitivity_df[sensitivity_df["KPI"] == selected_kpi].iloc[0]
-    base_kpi = selected_row["Baseline_Value"]
-    scenario_kpi = base_kpi * (1.0 + shock_pct / 100.0) if pd.notna(base_kpi) else np.nan
-    delta_kpi = scenario_kpi - base_kpi if pd.notna(base_kpi) and pd.notna(scenario_kpi) else np.nan
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Baseline Avg TAT", f"{baseline_avg_tat:.1f} days")
+    m2.metric("Projected Avg TAT", f"{projected_avg_tat:.1f} days")
+    m3.metric("Days Saved", f"{days_saved:.1f} days")
+    m4.metric("% Reduction", f"{pct_reduction:.1f}%")
 
-    slope = selected_row["Sensitivity_Days_per_Unit"]
-    tat_impact = slope * delta_kpi if pd.notna(slope) and pd.notna(delta_kpi) else np.nan
-    simulated_tat = max(0.0, baseline_tat + tat_impact) if pd.notna(tat_impact) else np.nan
+    before_after_df = pd.DataFrame(
+        {
+            "Scenario": ["Baseline", "Projected"],
+            "Avg_TAT_Days": [baseline_avg_tat, projected_avg_tat],
+        }
+    )
+    fig_before_after = px.bar(
+        before_after_df,
+        x="Scenario",
+        y="Avg_TAT_Days",
+        color="Scenario",
+        title="Average TAT: Before vs After Reason Efficiency Improvements",
+        text="Avg_TAT_Days",
+        color_discrete_map={"Baseline": "#1976D2", "Projected": "#EF6C00"},
+    )
+    fig_before_after.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+    st.plotly_chart(fig_before_after, use_container_width=True)
 
-    with right_col:
-        with st.container(border=True):
-            st.markdown("### Estimated TAT Impact")
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Baseline Mean TAT", f"{baseline_tat:.1f} days")
-            m2.metric(
-                "Simulated Mean TAT",
-                f"{simulated_tat:.1f} days" if pd.notna(simulated_tat) else "N/A",
-            )
-            m3.metric(
-                "Estimated Impact",
-                f"{tat_impact:+.1f} days" if pd.notna(tat_impact) else "N/A",
-            )
-            m4.metric(
-                "Model Strength (R²)",
-                f"{selected_row['Model_R2']:.2f}" if pd.notna(selected_row["Model_R2"]) else "N/A",
-            )
+    reason_cols = [c for c in claim_model_df.columns if c.startswith(REASON_COL_PREFIX)]
+    reason_impact_rows = []
+    for col in reason_cols:
+        reason = col[len(REASON_COL_PREFIX):]
+        base_total = float(claim_model_df[col].sum())
+        pct = float(reduction_map.get(reason, 0.0))
+        new_total = base_total * (1 - pct / 100.0)
+        saved_total = base_total - new_total
 
-            scenario_df = pd.DataFrame(
-                {
-                    "Scenario": ["Baseline", "Simulated"],
-                    "Mean_TAT_Days": [baseline_tat, simulated_tat if pd.notna(simulated_tat) else baseline_tat],
-                }
-            )
-            fig_scenario = px.bar(
-                scenario_df,
-                x="Scenario",
-                y="Mean_TAT_Days",
-                color="Scenario",
-                title="TAT Before vs After Shock",
-                text="Mean_TAT_Days",
-                color_discrete_map={"Baseline": "#1976D2", "Simulated": "#EF6C00"},
-            )
-            fig_scenario.update_traces(texttemplate="%{text:.1f}", textposition="outside")
-            fig_scenario.add_hline(y=7, line_dash="dash", line_color="#D32F2F", annotation_text="7-day mark")
-            st.plotly_chart(fig_scenario, use_container_width=True)
+        meta_row = reason_summary_df[reason_summary_df["Reason"] == reason]
+        avg_hold_time = float(meta_row["Avg_Hold_Time"].iloc[0]) if not meta_row.empty else np.nan
+        event_count = int(meta_row["Event_Count"].iloc[0]) if not meta_row.empty else 0
 
-            unit = selected_row["Unit"]
-            unit_suffix = unit if unit else "units"
-            st.caption(
-                f"{selected_kpi}: {base_kpi:.1f} -> {scenario_kpi:.1f} {unit_suffix} at {shock_pct:+.1f}% shock "
-                f"| Model: {selected_row['Model_Type']} | Samples: {int(selected_row['Samples_Used'])}"
-            )
+        reason_impact_rows.append(
+            {
+                "onHoldReasonDescriptionsHistory": reason,
+                "Event_Count": event_count,
+                "Avg_Hold_Time": avg_hold_time,
+                "Total_Hold_Time": base_total,
+                "Efficiency_Improvement_%": pct,
+                "Projected_Total_Hold_Time": new_total,
+                "Total_Hold_Time_Saved": saved_total,
+            }
+        )
 
-    st.markdown("#### KPI Sensitivity Reference")
-    ref_cols = ["KPI", "Baseline_Value", "Sensitivity_Days_per_Unit", "Model_R2", "Samples_Used", "Model_Type"]
-    st.dataframe(style_table_one_decimal(sensitivity_df[ref_cols]), use_container_width=True, hide_index=True)
-    st.caption("Sensitivity is estimated from current filtered data. Use this as directional what-if analysis, not a causal guarantee.")
+    reason_impact_df = pd.DataFrame(reason_impact_rows).sort_values("Total_Hold_Time", ascending=False)
+    if not reason_impact_df.empty:
+        st.markdown("### Hold Reason Impact Table")
+        st.dataframe(style_table_one_decimal(reason_impact_df), use_container_width=True, hide_index=True)
+
+        top_reason_chart_df = reason_impact_df.head(top_n).copy()
+        fig_reason_impact = px.bar(
+            top_reason_chart_df,
+            x="onHoldReasonDescriptionsHistory",
+            y="Total_Hold_Time_Saved",
+            title="Hold Time Saved by Reason (Based on Efficiency Inputs)",
+            text="Total_Hold_Time_Saved",
+            color="Total_Hold_Time_Saved",
+            color_continuous_scale="YlOrRd",
+        )
+        fig_reason_impact.update_traces(texttemplate="%{text:.1f}", textposition="outside")
+        fig_reason_impact.update_xaxes(tickangle=35)
+        st.plotly_chart(fig_reason_impact, use_container_width=True)
+
+    st.caption(
+        "Model used: TAT = Base Time + sum(onHoldReasonDescriptionsHistory[i] delays). "
+        "Each selected reason delay is reduced by the configured efficiency percentage."
+    )
 
 
 def main():

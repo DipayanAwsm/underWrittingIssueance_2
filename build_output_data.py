@@ -27,6 +27,15 @@ RECOMMENDATION_COLUMNS = [
     "Next Steps for Ops Team",
     "Next Steps for Customer Service",
 ]
+DELAY_DRIVER_COLUMNS = [
+    "Missing Records Delay",
+    "Customer Response Delay",
+    "Internal Rework Delay",
+    "Provider Response Delay",
+    "Third Party Delay",
+    "Legal Review Delay",
+    "Other Delays",
+]
 
 
 def load_data(input_path: str | Path) -> pd.DataFrame:
@@ -142,6 +151,34 @@ def best_recommendation_key(reason_norm: str, rec_norm_values: list[str]) -> str
     if scored and scored[0][0] >= 0.58:
         return scored[0][1]
     return None
+
+
+def classify_delay_driver(reason_text: object) -> str:
+    text = normalize_reason_text(reason_text)
+    if not text:
+        return "Other Delays"
+
+    missing_kw = {"missing", "document", "record", "incomplete", "paperwork"}
+    customer_kw = {"customer", "response", "follow", "pending", "confirm", "receipt"}
+    rework_kw = {"rework", "review", "validation", "booking", "qa", "manual", "edit", "underwriting", "approval"}
+    provider_kw = {"provider", "medical", "hospital", "doctor"}
+    third_party_kw = {"third", "external", "vendor", "broker", "distribution", "ocip"}
+    legal_kw = {"legal", "litigation", "lawsuit", "compliance", "regulatory"}
+
+    tokens = set(text.split())
+    if tokens & missing_kw:
+        return "Missing Records Delay"
+    if tokens & customer_kw:
+        return "Customer Response Delay"
+    if tokens & rework_kw:
+        return "Internal Rework Delay"
+    if tokens & provider_kw:
+        return "Provider Response Delay"
+    if tokens & third_party_kw:
+        return "Third Party Delay"
+    if tokens & legal_kw:
+        return "Legal Review Delay"
+    return "Other Delays"
 
 
 def load_recommendation_reference(path: Path | str = "recommendation.csv") -> pd.DataFrame:
@@ -419,6 +456,172 @@ def build_reason_events(prepared_df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(records)
 
 
+def build_aht_delay_components(prepared_df: pd.DataFrame) -> pd.DataFrame:
+    request_col = resolve_column(prepared_df, ["requestId"])
+    process_col = resolve_column(prepared_df, ["processId"])
+
+    completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
+    if completed_df.empty:
+        base_cols = ["Claim_ID", "requestId", "processId", "Base Time", "Total AHT"] + DELAY_DRIVER_COLUMNS
+        return pd.DataFrame(columns=base_cols)
+
+    records = []
+    for _, row in completed_df.iterrows():
+        tat = row.get("TAT_Days")
+        if pd.isna(tat):
+            continue
+
+        reasons = row.get("Hold_Reasons_List", [])
+        days_list = row.get("Hold_Days_List", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        if not isinstance(days_list, list):
+            days_list = []
+
+        driver_days = {c: 0.0 for c in DELAY_DRIVER_COLUMNS}
+        for idx, day_val in enumerate(days_list):
+            if pd.isna(day_val):
+                continue
+            reason = reasons[idx] if idx < len(reasons) else "Unknown"
+            driver = classify_delay_driver(reason)
+            driver_days[driver] += float(day_val)
+
+        total_delay = float(sum(driver_days.values()))
+        baseline_aht = float(tat)
+        if total_delay > baseline_aht and total_delay > 0:
+            scale = baseline_aht / total_delay
+            for c in DELAY_DRIVER_COLUMNS:
+                driver_days[c] *= scale
+            total_delay = float(sum(driver_days.values()))
+
+        base_time = max(baseline_aht - total_delay, 0.0)
+        out = {
+            "Claim_ID": row.get(request_col) if request_col else row.get(process_col),
+            "requestId": row.get(request_col) if request_col else None,
+            "processId": row.get(process_col) if process_col else None,
+            "Base Time": float(base_time),
+            "Total AHT": float(base_time + total_delay),
+        }
+        for c in DELAY_DRIVER_COLUMNS:
+            out[c] = float(driver_days[c])
+        records.append(out)
+
+    return pd.DataFrame(records)
+
+
+def build_tat_reason_model_tables(prepared_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    request_col = resolve_column(prepared_df, ["requestId"])
+    process_col = resolve_column(prepared_df, ["processId"])
+
+    completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
+    if completed_df.empty:
+        claim_cols = [
+            "row_index",
+            "Claim_ID",
+            "requestId",
+            "processId",
+            "Baseline_TAT",
+            "Base_Time",
+            "Total_Reason_Delay",
+            "Hold_Reason_Count",
+        ]
+        comp_cols = [
+            "row_index",
+            "Claim_ID",
+            "requestId",
+            "processId",
+            "onHoldReasonDescriptionsHistory",
+            "Reason_Delay_Days",
+            "Baseline_TAT",
+        ]
+        summary_cols = ["onHoldReasonDescriptionsHistory", "Claim_Count", "Avg_Hold_Time", "Total_Hold_Time"]
+        return pd.DataFrame(columns=claim_cols), pd.DataFrame(columns=comp_cols), pd.DataFrame(columns=summary_cols)
+
+    claim_rows = []
+    comp_rows = []
+
+    for row_index, row in completed_df.iterrows():
+        tat = row.get("TAT_Days")
+        if pd.isna(tat):
+            continue
+        tat = float(tat)
+
+        reasons = row.get("Hold_Reasons_List", [])
+        days_list = row.get("Hold_Days_List", [])
+        if not isinstance(reasons, list):
+            reasons = []
+        if not isinstance(days_list, list):
+            days_list = []
+
+        reason_totals: dict[str, float] = {}
+        for i, day_val in enumerate(days_list):
+            if pd.isna(day_val):
+                continue
+            d = float(day_val)
+            if d < 0:
+                continue
+            reason = reasons[i] if i < len(reasons) else "Unknown"
+            reason = str(reason).strip() if str(reason).strip() else "Unknown"
+            reason_totals[reason] = reason_totals.get(reason, 0.0) + d
+
+        total_reason_delay = float(sum(reason_totals.values()))
+        scale = 1.0
+        if total_reason_delay > tat and total_reason_delay > 0:
+            scale = tat / total_reason_delay
+
+        scaled_totals = {k: v * scale for k, v in reason_totals.items()}
+        total_scaled_delay = float(sum(scaled_totals.values()))
+        base_time = max(tat - total_scaled_delay, 0.0)
+
+        claim_id_val = row.get(request_col) if request_col else row.get(process_col)
+        claim_rows.append(
+            {
+                "row_index": int(row_index),
+                "Claim_ID": claim_id_val if pd.notna(claim_id_val) else f"row_{int(row_index)}",
+                "requestId": row.get(request_col) if request_col else None,
+                "processId": row.get(process_col) if process_col else None,
+                "Baseline_TAT": tat,
+                "Base_Time": float(base_time),
+                "Total_Reason_Delay": total_scaled_delay,
+                "Hold_Reason_Count": int(len(scaled_totals)),
+            }
+        )
+
+        for reason, delay_val in scaled_totals.items():
+            comp_rows.append(
+                {
+                    "row_index": int(row_index),
+                    "Claim_ID": claim_id_val if pd.notna(claim_id_val) else f"row_{int(row_index)}",
+                    "requestId": row.get(request_col) if request_col else None,
+                    "processId": row.get(process_col) if process_col else None,
+                    "onHoldReasonDescriptionsHistory": reason,
+                    "Reason_Delay_Days": float(delay_val),
+                    "Baseline_TAT": tat,
+                }
+            )
+
+    claim_df = pd.DataFrame(claim_rows)
+    comp_df = pd.DataFrame(comp_rows)
+
+    if comp_df.empty:
+        summary_df = pd.DataFrame(
+            columns=["onHoldReasonDescriptionsHistory", "Claim_Count", "Avg_Hold_Time", "Total_Hold_Time"]
+        )
+    else:
+        summary_df = (
+            comp_df.groupby("onHoldReasonDescriptionsHistory")
+            .agg(
+                Claim_Count=("Claim_ID", "nunique"),
+                Avg_Hold_Time=("Reason_Delay_Days", "mean"),
+                Total_Hold_Time=("Reason_Delay_Days", "sum"),
+            )
+            .reset_index()
+            .sort_values("Total_Hold_Time", ascending=False)
+        )
+
+    return claim_df, comp_df, summary_df
+
+
 def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
     completed_df = prepared_df[prepared_df["TAT_Days"].notna()].copy()
     high_tat_df = completed_df[completed_df["TAT_Bucket"] == "7+ days"].copy()
@@ -426,6 +629,8 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
 
     hold_events_df = build_hold_events(prepared_df)
     reason_events_df = build_reason_events(prepared_df)
+    aht_delay_components_df = build_aht_delay_components(prepared_df)
+    tat_reason_model_df, tat_reason_components_df, tat_reason_summary_df = build_tat_reason_model_tables(prepared_df)
     recommendation_df = load_recommendation_reference()
 
     monthly_tat_bucket = (
@@ -516,9 +721,13 @@ def build_output_tables(prepared_df: pd.DataFrame) -> dict[str, pd.DataFrame]:
         "fact_cases": prepared_df,
         "fact_hold_events": hold_events_df,
         "fact_reason_events": reason_events_df,
+        "fact_aht_delay_components": aht_delay_components_df,
+        "fact_tat_reason_model": tat_reason_model_df,
+        "fact_tat_reason_components": tat_reason_components_df,
         "agg_monthly_tat_bucket": monthly_tat_bucket,
         "agg_monthly_holds_by_tat_bucket": monthly_holds_by_tat_bucket,
         "agg_hold_reason_impact": hold_reason_impact,
+        "agg_tat_reason_summary": tat_reason_summary_df,
         "agg_top_brokers": top_brokers,
         "agg_top_account_analyst_7plus": top_account_analyst_7plus,
         "agg_top_underwriter_7plus": top_underwriter_7plus,
