@@ -26,3 +26,12 @@ Tab 2 - Hold Intelligence,Top 10,Top UnderWriter Taking 7+ TAT Days (with Avg TA
 Tab 2 - Hold Intelligence,Top 10,Top raterFullName Taking 7+ TAT Days (with Avg TAT),agg_top_rater_7plus.csv,"Value, Number_of_Cases, Avg_TAT_Days"
 Tab 2 - Hold Intelligence,Cases,Last Month Highest TAT Cases Top 5,fact_cases.csv,"Latest Month_Str, sort by TAT_Days desc"
 Tab 2 - Hold Intelligence,Actions,Top On-Hold Reason + Prescribed Action,fact_cases.csv (or agg_hold_reason_impact.csv),Top reasons then map rule-based action
+Tab 3 - Shock Simulator,Model,TAT = Base Time + Sum(holdReason[i]),fact_tat_reason_model.csv + fact_tat_reason_components.csv,Reason-wise decomposition of Baseline_TAT into Base_Time and reason delay components
+Tab 3 - Shock Simulator,Controls,Top hold reasons to tune (individual efficiency %),agg_tat_reason_summary.csv,Top reasons by Total_Hold_Time with per-reason efficiency input
+Tab 3 - Shock Simulator,KPI,Baseline Avg TAT,fact_tat_reason_model.csv,Mean of Baseline_TAT
+Tab 3 - Shock Simulator,KPI,Projected Avg TAT,fact_tat_reason_model.csv,Mean of Projected_TAT after applying reason-wise efficiency reductions
+Tab 3 - Shock Simulator,KPI,Days Saved,fact_tat_reason_model.csv,Baseline Avg TAT - Projected Avg TAT
+Tab 3 - Shock Simulator,KPI,% Reduction,fact_tat_reason_model.csv,Days Saved / Baseline Avg TAT
+Tab 3 - Shock Simulator,Visualization,Average TAT Before vs After,fact_tat_reason_model.csv,Bar chart of Baseline Avg TAT and Projected Avg TAT
+Tab 3 - Shock Simulator,Table,Hold Reason Impact Table,agg_tat_reason_summary.csv + fact_tat_reason_components.csv,"Reason-wise Event_Count, Avg_Hold_Time, Total_Hold_Time, Projected_Total_Hold_Time, Total_Hold_Time_Saved"
+Tab 3 - Shock Simulator,Visualization,Hold Time Saved by Reason,agg_tat_reason_summary.csv + fact_tat_reason_components.csv,Bar chart using reason-wise Total_Hold_Time_Saved after efficiency shock
